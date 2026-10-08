@@ -72,3 +72,29 @@ Set `/setchannel Bot logs` to get command errors posted in a staff channel.
 - `/profile` is a player card (team logo, value, rank, stats, trophies). `/trophy_give` and `/trophy_remove` manage the cabinet.
 - `/table` draws the league table as an image with every team's logo, visible only to you.
 - `/schedule_shift tier new_start` moves a whole schedule (fixes a wrong start date).
+
+## Trophies
+- **/make_trophy name image** (admins only: Administrator, Manage Server or the owner): upload the trophy image (or paste a
+  direct link). The bot stores its own copy, so it never expires like Discord links do.
+- **/trophy_give player trophy** (staff) awards it: posts the trophy with its logo in the results channel and shows it in the
+  player's `/profile`, in a trophy shelf image directly under the "Player trophy cabinet" text (×N if won several times).
+- `/trophy_remove`, `/trophy_delete` (admins), `/trophies` (list with images).
+- Trophies given as plain text before this update get linked automatically when you create a trophy with the same name.
+
+## Updating the bot WITHOUT losing anything
+All teams, logos, budgets, rosters, fixtures, results, stats, trophies and channel settings live in **pitchx.db**.
+Updating the code never changes that file, and the bot only ever *adds* missing columns/tables.
+
+**To update:** stop the bot, replace only `bot.py`, `main.py` and `requirements.txt`, start it again.
+Do **not** delete or re-upload `pitchx.db`, `.env` or the `backups` folder, and don't use the host's "reinstall / wipe" button.
+
+Safety nets (automatic):
+1. **Backup at every start**, and every 6 hours, into the `backups` folder (newest 30 kept).
+2. **Auto-restore:** if the bot starts with an empty database but a backup exists, it restores the newest one by itself.
+3. **Discord copy:** run `/setchannel Backups #private-admin-channel` and the bot posts the database file there about once a day,
+   so even if the whole host is erased your data is still in Discord.
+4. `/backup` (admins) sends you the file now; `/restore database:<file>` (admins) loads one back. Restoring first saves the current data as a backup.
+5. On startup the console prints how many teams/players/fixtures were loaded, and `/health` shows where the data file is.
+
+If the data ever looks reset after an update, it usually means the bot was started from a *new folder* (new empty database).
+Fix: set `DB_PATH` to one fixed location in your variables, or run `/restore` with your latest backup file.

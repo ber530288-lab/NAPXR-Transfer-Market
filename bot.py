@@ -1,8 +1,11 @@
 import asyncio
+import glob
 import io
+import pathlib
 import aiohttp
 import os
 import re
+import shutil
 import sqlite3
 import datetime as dt
 import time
@@ -45,13 +48,47 @@ FORM = {"W": "🟢", "D": "🟡", "L": "🔴"}
 
 # ---------------------------------------------------------------- database
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "pitchx.db"))
+BACKUP_DIR = os.getenv("BACKUP_DIR", os.path.join(os.path.dirname(DB_PATH), "backups"))
+BACKUP_KEEP = int(os.getenv("BACKUP_KEEP", "30"))
+
+def _count(path, table="teams"):
+    """Row count of a table in a database file, read-only (0 if missing/unreadable). Never creates the file."""
+    try:
+        c = sqlite3.connect(pathlib.Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            return c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        finally:
+            c.close()
+    except Exception:
+        return 0
+
+def _latest_backup():
+    for f in sorted(glob.glob(os.path.join(BACKUP_DIR, "pitchx-*.db")), reverse=True):
+        if _count(f) > 0:
+            return f
+    return None
+
+# If the live database has no teams (fresh folder / wiped host) but a backup has data, bring the data back.
+if os.getenv("AUTO_RESTORE", "1") == "1" and _count(DB_PATH) == 0:
+    _b = _latest_backup()
+    if _b:
+        for _ext in ("-wal", "-shm"):
+            try:
+                os.remove(DB_PATH + _ext)
+            except OSError:
+                pass
+        shutil.copyfile(_b, DB_PATH)
+        print(f"[db] Database was empty, restored your data from {_b}")
+
 db = sqlite3.connect(DB_PATH)
 db.row_factory = sqlite3.Row
 try:
     db.execute('PRAGMA journal_mode=WAL'); db.execute('PRAGMA synchronous=NORMAL')
 except sqlite3.Error:
     pass
-db.executescript("""
+def ensure_schema():
+    """Create missing tables/columns only. Never deletes or resets data."""
+    db.executescript("""
 CREATE TABLE IF NOT EXISTS teams(
   id INTEGER PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE, logo TEXT, tier TEXT);
 CREATE TABLE IF NOT EXISTS players(
@@ -63,6 +100,8 @@ CREATE TABLE IF NOT EXISTS fixtures(
   id INTEGER PRIMARY KEY, gw INTEGER, home_id INTEGER, away_id INTEGER, kickoff REAL, tier TEXT,
   competition TEXT, status TEXT DEFAULT 'scheduled', home_goals INTEGER, away_goals INTEGER,
   notes TEXT, brief_sent INTEGER DEFAULT 0, played_at REAL, forfeit INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS trophy_types(
+  id INTEGER PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE, logo BLOB, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS match_stats(
   fixture_id INTEGER, user_id INTEGER, team_id INTEGER,
   goals INTEGER DEFAULT 0, assists INTEGER DEFAULT 0, clean_sheets INTEGER DEFAULT 0,
@@ -76,12 +115,35 @@ CREATE TABLE IF NOT EXISTS offers(
   staff_id INTEGER, guild_id INTEGER, created_at REAL, status TEXT DEFAULT 'pending');
 """)
 
-for _stmt in (f"ALTER TABLE teams ADD COLUMN budget INTEGER DEFAULT {START_BUDGET}",
-              "ALTER TABLE offers ADD COLUMN fee INTEGER DEFAULT 0"):
+    for _stmt in (f"ALTER TABLE teams ADD COLUMN budget INTEGER DEFAULT {START_BUDGET}",
+                  "ALTER TABLE offers ADD COLUMN fee INTEGER DEFAULT 0",
+                  "ALTER TABLE trophies ADD COLUMN trophy_id INTEGER"):
+        try:
+            db.execute(_stmt); db.commit()
+        except sqlite3.OperationalError:
+            pass   # column already exists
+
+ensure_schema()
+print(f"[db] {DB_PATH}: {db.execute('SELECT COUNT(*) FROM teams').fetchone()[0]} teams, "
+      f"{db.execute('SELECT COUNT(*) FROM players').fetchone()[0]} players, "
+      f"{db.execute('SELECT COUNT(*) FROM fixtures').fetchone()[0]} fixtures loaded")
+
+def backup_db(tag="auto"):
+    """Consistent snapshot of the live database into BACKUP_DIR; keeps the newest BACKUP_KEEP."""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(BACKUP_DIR, f"pitchx-{stamp}-{tag}.db")
+    dest = sqlite3.connect(path)
     try:
-        db.execute(_stmt); db.commit()
-    except sqlite3.OperationalError:
-        pass   # column already exists
+        db.backup(dest)
+    finally:
+        dest.close()
+    for old in sorted(glob.glob(os.path.join(BACKUP_DIR, "pitchx-*.db")))[:-BACKUP_KEEP]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    return path
 
 def get_team(name):
     return db.execute("SELECT * FROM teams WHERE name=?", (name,)).fetchone()
@@ -256,6 +318,16 @@ async def _staff_pred(i: discord.Interaction):
 # Runtime check (not hidden by Discord), so admins and the staff role can always use these.
 staff = app_commands.check(_staff_pred)
 
+async def _admin_pred(i: discord.Interaction):
+    if i.guild and isinstance(i.user, discord.Member):
+        p = i.user.guild_permissions
+        if p.administrator or p.manage_guild or i.user.id == i.guild.owner_id:
+            return True
+    raise app_commands.CheckFailure("not admin")
+
+# Stricter than `staff`: Administrator, Manage Server or the server owner (the staff role is not enough).
+admin_only = app_commands.check(_admin_pred)
+
 # ---------------------------------------------------------------- setup / teams
 @bot.tree.command(description="Set the channel where transactions are posted")
 @staff
@@ -364,7 +436,19 @@ def signed_ts(uid):
     except (TypeError, ValueError):
         return None
 
-def profile_embed(member):
+def trophy_cabinet(uid):
+    """A player's trophies grouped by type: [{'name', 'logo' (png bytes or None), 'n'}]"""
+    rows = db.execute("""SELECT t.title, t.trophy_id, tt.name, tt.logo FROM trophies t
+                         LEFT JOIN trophy_types tt ON tt.id=t.trophy_id
+                         WHERE t.user_id=? ORDER BY t.id DESC""", (uid,)).fetchall()
+    grouped = {}
+    for r in rows:
+        key = r["trophy_id"] or r["title"].lower()
+        g = grouped.setdefault(key, {"name": r["name"] or r["title"], "logo": r["logo"], "n": 0})
+        g["n"] += 1
+    return list(grouped.values())
+
+def profile_embed(member, cabinet):
     uid = member.id
     t = player_team(uid)
     g, a, c = player_totals(uid)
@@ -381,32 +465,182 @@ def profile_embed(member):
     e.add_field(name="🏟️ Tier", value=t["tier"] if t else "—")
     since = signed_ts(uid) if t else None
     e.add_field(name="📝 With club since", value=tsf(since, "D") if since else "—")
-    cabinet = db.execute("SELECT title FROM trophies WHERE user_id=? ORDER BY id DESC LIMIT 10", (uid,)).fetchall()
-    e.add_field(name="🏆 Player trophy cabinet", inline=False,
-                value="\n".join(f"🏆 {r['title']}" for r in cabinet) or "No trophies yet")
+    lines = [f"🏆 {x['name']}" + (f" ×{x['n']}" if x["n"] > 1 else "") for x in cabinet[:10]]
+    e.add_field(name="🏆 Player trophy cabinet", inline=False, value="\n".join(lines) or "No trophies yet")
     e.set_footer(text=f"{LEAGUE_SHORT} · Every stat moves you closer to the next rank")
     e.set_thumbnail(url=logo(t) or member.display_avatar.url)
     return e
 
-@bot.tree.command(description="View a player card: team, value, goals, assists, clean sheets, rank")
+def normalize_logo(data):
+    """Any readable image -> PNG, max 256x256 (so it can be stored and never expires)."""
+    try:
+        im = Image.open(io.BytesIO(data)).convert("RGBA")
+        im.thumbnail((256, 256))
+        buf = io.BytesIO()
+        im.save(buf, "PNG")
+        return buf.getvalue()
+    except Exception:
+        return None
+
+def render_cabinet(items):
+    """A shelf of the player's trophy logos with names (and ×N when won more than once)."""
+    items = items[:10]
+    per_row, SW, SH = 5, 150, 175
+    rows_n = (len(items) + per_row - 1) // per_row
+    W = SW * min(len(items), per_row)
+    img = Image.new("RGB", (W, rows_n * SH + 10), (30, 31, 34))
+    d = ImageDraw.Draw(img)
+    f_name, f_badge, f_star = _font(20, True), _font(18, True), _font(54, True)
+    for idx, it in enumerate(items):
+        r, c = divmod(idx, per_row)
+        x0, y0 = c * SW, r * SH + 5
+        cx, drawn, box = x0 + SW // 2, False, 110
+        if it["logo"]:
+            try:
+                im = Image.open(io.BytesIO(it["logo"])).convert("RGBA")
+                im.thumbnail((box, box))
+                img.paste(im, (cx - im.width // 2, y0 + 8 + (box - im.height) // 2), im)
+                drawn = True
+            except Exception:
+                pass
+        if not drawn:
+            d.ellipse((cx - 45, y0 + 13, cx + 45, y0 + 103), fill=(250, 204, 21))
+            _put(d, (cx, y0 + 58), "★", f_star, (30, 31, 34), "mm")
+        name = it["name"]
+        if d.textlength(name, font=f_name) > SW - 10:
+            while len(name) > 3 and d.textlength(name + "…", font=f_name) > SW - 10:
+                name = name[:-1]
+            name = name.rstrip() + "…"
+        _put(d, (cx, y0 + 138), name, f_name, (255, 255, 255), "mm")
+        if it["n"] > 1:
+            bx, by = cx + 34, y0 + 8
+            d.ellipse((bx, by, bx + 42, by + 42), fill=(88, 101, 242))
+            _put(d, (bx + 21, by + 21), f"×{it['n']}", f_badge, (255, 255, 255), "mm")
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+def trophy_file(tt, name="trophy.png"):
+    return discord.File(io.BytesIO(tt["logo"]), filename=name) if tt["logo"] else None
+
+async def trophy_ac(_, current: str):
+    rows = db.execute("SELECT name FROM trophy_types WHERE name LIKE ? ORDER BY name LIMIT 25", (f"%{current}%",)).fetchall()
+    return [app_commands.Choice(name=r["name"], value=r["name"]) for r in rows]
+
+@bot.tree.command(description="View a player card: team, value, goals, assists, clean sheets, trophies")
 async def profile(i: discord.Interaction, player: discord.Member = None, private: bool = False):
-    await i.response.send_message(embed=profile_embed(player or i.user), ephemeral=private)
+    await i.response.defer(ephemeral=private)
+    member = player or i.user
+    cabinet = trophy_cabinet(member.id)
+    e = profile_embed(member, cabinet)
+    kw = {}
+    if cabinet and Image is not None:
+        png = await asyncio.to_thread(render_cabinet, cabinet)
+        kw["file"] = discord.File(io.BytesIO(png), filename="cabinet.png")
+        e.set_image(url="attachment://cabinet.png")     # shows right under the trophy cabinet
+    await i.followup.send(embed=e, **kw)
 
-@bot.tree.command(description="Give a player a trophy for their cabinet")
-@staff
-async def trophy_give(i: discord.Interaction, player: discord.Member, title: str):
-    db.execute("INSERT INTO trophies(user_id,title) VALUES(?,?)", (player.id, title[:100])); db.commit()
-    await i.response.send_message(f"🏆 Gave {player.mention} **{title[:100]}**.", ephemeral=True)
+@bot.tree.command(description="Create a trophy with a name and logo (admins only)")
+@admin_only
+@app_commands.describe(name="Trophy name, e.g. Ballon d'Or", image="Upload the trophy image",
+                       logo_url="...or paste a direct image link instead")
+async def make_trophy(i: discord.Interaction, name: str, image: discord.Attachment = None, logo_url: str = None):
+    await i.response.defer(ephemeral=True)
+    if Image is None:
+        return await i.followup.send("❌ Pillow isn't installed on the host. Add `Pillow` to requirements.txt.")
+    name = name.strip()[:60]
+    if not name:
+        return await i.followup.send("Give the trophy a name.")
+    if db.execute("SELECT 1 FROM trophy_types WHERE name=?", (name,)).fetchone():
+        return await i.followup.send(f"A trophy called **{name}** already exists.")
+    if image:
+        if image.content_type and not image.content_type.startswith("image/"):
+            return await i.followup.send("That file isn't an image. Upload a PNG or JPG.")
+        if image.size > 8_000_000:
+            return await i.followup.send("That image is too big (max 8 MB).")
+        raw = await image.read()
+    elif logo_url:
+        raw = await fetch_logo(logo_url)
+        if not raw:
+            return await i.followup.send("❌ Couldn't download an image from that link. Upload the image instead.")
+    else:
+        return await i.followup.send("Upload an image (the `image` box) or paste a `logo_url`.")
+    png = await asyncio.to_thread(normalize_logo, raw)
+    if not png:
+        return await i.followup.send("❌ I couldn't read that image. Use a PNG or JPG.")
+    cur = db.execute("INSERT INTO trophy_types(name, logo) VALUES(?,?)", (name, png))
+    linked = db.execute("UPDATE trophies SET trophy_id=? WHERE trophy_id IS NULL AND lower(title)=lower(?)",
+                        (cur.lastrowid, name)).rowcount
+    db.commit()
+    e = discord.Embed(title=f"🏆 Trophy created: {name}", color=YELLOW,
+                      description="Award it with `/trophy_give`. Winners see it in their profile's trophy cabinet."
+                      + (f"\nLinked **{linked}** existing award(s) with this name." if linked else ""))
+    e.set_thumbnail(url="attachment://trophy.png")
+    await i.followup.send(embed=e, file=discord.File(io.BytesIO(png), filename="trophy.png"))
 
-@bot.tree.command(description="Remove a trophy from a player's cabinet")
+@bot.tree.command(description="Award a trophy to a player")
 @staff
-async def trophy_remove(i: discord.Interaction, player: discord.Member, title: str):
+@app_commands.autocomplete(trophy=trophy_ac)
+async def trophy_give(i: discord.Interaction, player: discord.Member, trophy: str):
+    await i.response.defer(ephemeral=True)
+    tt = db.execute("SELECT * FROM trophy_types WHERE name=?", (trophy,)).fetchone()
+    if not tt:
+        return await i.followup.send("That trophy doesn't exist. An admin can create it with /make_trophy.")
+    db.execute("INSERT INTO trophies(user_id,title,trophy_id) VALUES(?,?,?)", (player.id, tt["name"], tt["id"])); db.commit()
+    n = db.execute("SELECT COUNT(*) FROM trophies WHERE user_id=? AND trophy_id=?", (player.id, tt["id"])).fetchone()[0]
+    e = discord.Embed(title=f"🏆 {tt['name']}", color=YELLOW, timestamp=discord.utils.utcnow(),
+                      description=f"{player.mention} has been awarded **{tt['name']}**!" + (f" (×{n})" if n > 1 else ""))
+    e.set_author(name=f"{LEAGUE_SHORT} Trophies", icon_url=LEAGUE_LOGO)
+    if tt["logo"]:
+        e.set_thumbnail(url="attachment://trophy.png")
+    kw = {"file": trophy_file(tt)} if tt["logo"] else {}
+    await i.followup.send(embed=e, **kw)
+    guild = get_guild() or i.guild
+    ch = chan(guild, "results_channel") or chan(guild, "matchday_channel")
+    if ch:
+        try:
+            kw = {"file": trophy_file(tt)} if tt["logo"] else {}
+            await ch.send(content=player.mention, embed=e, **kw)
+        except Exception as ex:
+            print(f"[trophy] announce failed: {ex!r}")
+
+@bot.tree.command(description="Remove one trophy award from a player")
+@staff
+@app_commands.autocomplete(trophy=trophy_ac)
+async def trophy_remove(i: discord.Interaction, player: discord.Member, trophy: str):
     r = db.execute("SELECT id FROM trophies WHERE user_id=? AND lower(title)=lower(?) ORDER BY id DESC LIMIT 1",
-                   (player.id, title)).fetchone()
+                   (player.id, trophy)).fetchone()
     if not r:
-        return await i.response.send_message("That player has no trophy with that exact name.", ephemeral=True)
+        return await i.response.send_message("That player doesn't have that trophy.", ephemeral=True)
     db.execute("DELETE FROM trophies WHERE id=?", (r["id"],)); db.commit()
-    await i.response.send_message(f"🗑️ Removed **{title}** from {player.mention}'s cabinet.", ephemeral=True)
+    await i.response.send_message(f"🗑️ Removed **{trophy}** from {player.mention}'s cabinet.", ephemeral=True)
+
+@bot.tree.command(description="Delete a trophy (admins only). Awards already given stay as text")
+@admin_only
+@app_commands.autocomplete(trophy=trophy_ac)
+async def trophy_delete(i: discord.Interaction, trophy: str):
+    tt = db.execute("SELECT id FROM trophy_types WHERE name=?", (trophy,)).fetchone()
+    if not tt:
+        return await i.response.send_message("Trophy not found.", ephemeral=True)
+    db.execute("UPDATE trophies SET trophy_id=NULL WHERE trophy_id=?", (tt["id"],))
+    db.execute("DELETE FROM trophy_types WHERE id=?", (tt["id"],)); db.commit()
+    await i.response.send_message(f"🗑️ Deleted trophy **{trophy}**.", ephemeral=True)
+
+@bot.tree.command(description="List the league's trophies")
+async def trophies(i: discord.Interaction):
+    rows = db.execute("""SELECT tt.*, (SELECT COUNT(*) FROM trophies t WHERE t.trophy_id=tt.id) n
+                         FROM trophy_types tt ORDER BY name LIMIT 10""").fetchall()
+    if not rows:
+        return await i.response.send_message("No trophies yet. Admins can create one with /make_trophy.", ephemeral=True)
+    embeds, files = [], []
+    for r in rows:
+        fn = f"trophy_{r['id']}.png"
+        e = discord.Embed(title=f"🏆 {r['name']}", color=YELLOW, description=f"Awarded **{r['n']}** time(s)")
+        if r["logo"]:
+            e.set_thumbnail(url=f"attachment://{fn}")
+            files.append(trophy_file(r, fn))
+        embeds.append(e)
+    await i.response.send_message(embeds=embeds, files=files)
 
 @bot.tree.command(description="Show team budgets and squad values (defaults to your team)")
 @app_commands.autocomplete(team=team_ac)
@@ -1504,7 +1738,8 @@ async def schedule_shift(i: discord.Interaction, tier: str, new_start: str):
 @app_commands.choices(kind=[app_commands.Choice(name="Transactions", value="tx_channel"),
                             app_commands.Choice(name="Matchdays", value="matchday_channel"),
                             app_commands.Choice(name="Results", value="results_channel"),
-                            app_commands.Choice(name="Bot logs (errors)", value="log_channel")])
+                            app_commands.Choice(name="Bot logs (errors)", value="log_channel"),
+                            app_commands.Choice(name="Backups (keep private!)", value="backup_channel")])
 async def setchannel(i: discord.Interaction, kind: app_commands.Choice[str], channel: discord.TextChannel):
     set_setting(kind.value, str(channel.id)); set_setting("guild_id", str(i.guild_id))
     await i.response.send_message(f"✅ **{kind.name}** will post in {channel.mention}", ephemeral=True)
@@ -1560,6 +1795,9 @@ async def health(i: discord.Interaction):
              f"{one('SELECT COUNT(*) FROM players WHERE team_id IS NOT NULL')} rostered players • "
              f"{one('SELECT COUNT(*) FROM managers')} managers • "
              f"{one('SELECT COUNT(*) FROM fixtures WHERE status=' + chr(39) + 'scheduled' + chr(39))} scheduled fixtures")
+    nb = len(glob.glob(os.path.join(BACKUP_DIR, "pitchx-*.db")))
+    lines.append(f"💾 Data file: `{DB_PATH}` ({os.path.getsize(DB_PATH) // 1024} KB) • {nb} local backups"
+                 + ("" if chan(g, "backup_channel") else " • ⚠️ no Discord backup channel (/setchannel Backups)"))
     lines.append(f"📊 {stats}")
     lines.append(f"🕒 Timezone: {getattr(league_tz(), 'key', 'UTC')} • discord.py {discord.__version__}")
     if not get_setting("staff_role"):
@@ -1646,6 +1884,74 @@ async def reminder_now(i: discord.Interaction, kind: app_commands.Choice[str]):
     sent, failed = await send_reminders(kind.value)
     await i.followup.send(f"📨 Reminder sent: {sent} DMs, {failed} failed.")
 
+@tasks.loop(hours=6)
+async def backup_loop():
+    """Backs up at every start and every 6h; posts a copy to the backup channel about once a day."""
+    try:
+        if db.execute("SELECT COUNT(*) FROM teams").fetchone()[0] == 0:
+            return   # never rotate good backups out because of an empty database
+        path = backup_db("auto")
+    except Exception:
+        traceback.print_exc()
+        return
+    ch = chan(get_guild(), "backup_channel")
+    if ch and time.time() - float(get_setting("last_backup_post") or 0) >= 20 * 3600:
+        try:
+            if os.path.getsize(path) < 9_000_000:
+                await ch.send(f"💾 {LEAGUE_SHORT} database backup • {discord.utils.utcnow():%Y-%m-%d %H:%M} UTC",
+                              file=discord.File(path, filename="pitchx.db"))
+                set_setting("last_backup_post", str(time.time()))
+            else:
+                await ch.send("⚠️ The database is too big to attach here. Use /backup to download it.")
+        except Exception as ex:
+            print(f"[backup] channel post failed: {ex!r}")
+
+@backup_loop.before_loop
+async def _wait_bk():
+    await bot.wait_until_ready()
+
+@bot.tree.command(description="Download a backup of ALL league data (admins only)")
+@admin_only
+async def backup(i: discord.Interaction):
+    await i.response.defer(ephemeral=True)
+    path = backup_db("manual")
+    if os.path.getsize(path) >= 9_000_000:
+        return await i.followup.send(f"💾 Backup saved on the host at `{path}` (too large to attach).")
+    await i.followup.send("💾 Backup of teams, players, budgets, fixtures, results, stats, trophies and settings. "
+                          "Keep this file safe. `/restore` loads it back.", file=discord.File(path, filename="pitchx.db"))
+
+@bot.tree.command(description="Restore ALL league data from a backup file (admins only)")
+@admin_only
+@app_commands.describe(database="The pitchx.db file you got from /backup")
+async def restore(i: discord.Interaction, database: discord.Attachment):
+    await i.response.defer(ephemeral=True)
+    if database.size > 50_000_000:
+        return await i.followup.send("That file is too big to be a PitchX backup.")
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    tmp = os.path.join(BACKUP_DIR, "incoming.tmp")
+    await database.save(tmp)
+    try:
+        chk = sqlite3.connect(tmp)
+        tables = {r[0] for r in chk.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not {"teams", "players", "settings"} <= tables:
+            chk.close()
+            return await i.followup.send("❌ That file isn't a PitchX backup (missing tables). Nothing was changed.")
+        n_teams = chk.execute("SELECT COUNT(*) FROM teams").fetchone()[0]
+        n_players = chk.execute("SELECT COUNT(*) FROM players").fetchone()[0]
+        pre = backup_db("pre-restore")           # safety copy of what is live right now
+        chk.backup(db)                           # replaces the live data with the uploaded copy
+        chk.close()
+        ensure_schema()                          # upgrade older backups to the current layout
+    except sqlite3.DatabaseError as ex:
+        return await i.followup.send(f"❌ That isn't a readable database ({ex}). Nothing was changed.")
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    await i.followup.send(f"✅ Restored **{n_teams}** teams and **{n_players}** players (plus fixtures, budgets, stats, "
+                          f"trophies, settings). What was live before is saved as `{os.path.basename(pre)}`.")
+
 @bot.tree.command(description="Set the role that can use staff commands (admins always can)")
 @staff
 async def staffrole(i: discord.Interaction, role: discord.Role):
@@ -1665,7 +1971,9 @@ async def log_error(where, err):
 @bot.tree.error
 async def on_app_error(i: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CheckFailure):
-        if str(error) == "not staff or manager":
+        if str(error) == "not admin":
+            msg = "🚫 Admins only (Administrator or Manage Server)."
+        elif str(error) == "not staff or manager":
             msg = "🚫 Only staff and team managers can use this. Ask staff to add you with /manager_add."
         else:
             msg = "🚫 Staff only. You need Administrator, Manage Server, or the staff role (/staffrole)."
@@ -1686,6 +1994,7 @@ async def on_app_error(i: discord.Interaction, error: app_commands.AppCommandErr
 async def setup_hook():
     bot.add_dynamic_items(OfferButton)
     reminder_loop.start()
+    backup_loop.start()
     matchday_loop.start()
     if GUILD_ID:
         # server-only commands (appear instantly); wipe the global copies that cause duplicates
