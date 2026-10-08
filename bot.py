@@ -1,4 +1,6 @@
 import asyncio
+import io
+import aiohttp
 import os
 import re
 import sqlite3
@@ -10,6 +12,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:   # /table needs Pillow
+    Image = None
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -25,6 +31,14 @@ DASHBOARD_URL = _url(os.getenv("DASHBOARD_URL"))
 REMINDER_DAYS = float(os.getenv("REMINDER_DAYS", "14"))
 MATCHDAY_LEAD_HOURS = float(os.getenv("MATCHDAY_LEAD_HOURS", "24"))
 OFFER_HOURS = 48
+START_BUDGET = int(os.getenv("START_BUDGET", "100000000"))
+MIN_FEE_PERCENT = float(os.getenv("MIN_FEE_PERCENT", "100"))      # transfer fee must be at least this % of market value
+PLAYER_BASE_VALUE = int(os.getenv("PLAYER_BASE_VALUE", "500000"))
+GOAL_VALUE = int(os.getenv("GOAL_VALUE", "600000"))
+ASSIST_VALUE = int(os.getenv("ASSIST_VALUE", "350000"))
+CLEANSHEET_VALUE = int(os.getenv("CLEANSHEET_VALUE", "400000"))
+VALUE_SOFT_CAP = int(os.getenv("VALUE_SOFT_CAP", "6000000"))       # past this, extra output adds value at half rate
+MAX_PLAYER_VALUE = int(os.getenv("MAX_PLAYER_VALUE", "20000000"))
 
 PINK, ORANGE, GREEN, YELLOW, RED = 0xE91E63, 0xF57C00, 0x2ECC71, 0xF1C40F, 0xE74C3C
 FORM = {"W": "🟢", "D": "🟡", "L": "🔴"}
@@ -49,12 +63,25 @@ CREATE TABLE IF NOT EXISTS fixtures(
   id INTEGER PRIMARY KEY, gw INTEGER, home_id INTEGER, away_id INTEGER, kickoff REAL, tier TEXT,
   competition TEXT, status TEXT DEFAULT 'scheduled', home_goals INTEGER, away_goals INTEGER,
   notes TEXT, brief_sent INTEGER DEFAULT 0, played_at REAL, forfeit INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS match_stats(
+  fixture_id INTEGER, user_id INTEGER, team_id INTEGER,
+  goals INTEGER DEFAULT 0, assists INTEGER DEFAULT 0, clean_sheets INTEGER DEFAULT 0,
+  PRIMARY KEY(fixture_id, user_id));
+CREATE TABLE IF NOT EXISTS trophies(
+  id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT, awarded_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS managers(
   team_id INTEGER, user_id INTEGER, PRIMARY KEY(team_id, user_id));
 CREATE TABLE IF NOT EXISTS offers(
   id INTEGER PRIMARY KEY, user_id INTEGER, kind TEXT, team_id INTEGER, from_team_id INTEGER,
   staff_id INTEGER, guild_id INTEGER, created_at REAL, status TEXT DEFAULT 'pending');
 """)
+
+for _stmt in (f"ALTER TABLE teams ADD COLUMN budget INTEGER DEFAULT {START_BUDGET}",
+              "ALTER TABLE offers ADD COLUMN fee INTEGER DEFAULT 0"):
+    try:
+        db.execute(_stmt); db.commit()
+    except sqlite3.OperationalError:
+        pass   # column already exists
 
 def get_team(name):
     return db.execute("SELECT * FROM teams WHERE name=?", (name,)).fetchone()
@@ -94,6 +121,103 @@ def dashboard_view():
     v = discord.ui.View()
     v.add_item(discord.ui.Button(label="Open Your Dashboard", emoji="🏟️", url=DASHBOARD_URL))
     return v
+
+def money(n):
+    return f"${int(n):,}"
+
+def parse_money(text):
+    """'5000000', '5,000,000', '$5m', '2.5m', '750k' -> int dollars (None if unreadable)."""
+    t = str(text).strip().lower().replace("$", "").replace(",", "").replace(" ", "")
+    mult = 1
+    if t.endswith("k"):
+        mult, t = 1_000, t[:-1]
+    elif t.endswith("m"):
+        mult, t = 1_000_000, t[:-1]
+    elif t.endswith("b"):
+        mult, t = 1_000_000_000, t[:-1]
+    try:
+        v = float(t) * mult
+    except ValueError:
+        return None
+    if not (0 <= v < 1e15):
+        return None
+    return int(round(v))
+
+def budget_of(team):
+    return team["budget"] if team["budget"] is not None else START_BUDGET
+
+def player_totals(uid):
+    r = db.execute("""SELECT COALESCE(SUM(goals),0) g, COALESCE(SUM(assists),0) a,
+                      COALESCE(SUM(clean_sheets),0) c FROM match_stats WHERE user_id=?""", (uid,)).fetchone()
+    return r["g"], r["a"], r["c"]
+
+def value_from(g, a, c):
+    """Market value from output. Linear at first, then half-rate past the soft cap, hard-capped overall."""
+    raw = g * GOAL_VALUE + a * ASSIST_VALUE + c * CLEANSHEET_VALUE
+    if raw > VALUE_SOFT_CAP:
+        raw = VALUE_SOFT_CAP + (raw - VALUE_SOFT_CAP) * 0.5
+    return int(round(min(PLAYER_BASE_VALUE + raw, MAX_PLAYER_VALUE), -4))
+
+def player_value(uid):
+    return value_from(*player_totals(uid))
+
+def rank_points(g, a, c):
+    return (g + a + c) * 2
+
+RANKS = ["Bronze I", "Bronze II", "Bronze III", "Silver I", "Silver II", "Silver III",
+         "Gold I", "Gold II", "Gold III", "Platinum I", "Platinum II", "Platinum III",
+         "Diamond I", "Diamond II", "Diamond III", "Elite"]
+
+def rank_line(pts):
+    idx = min(pts // 10, len(RANKS) - 1)
+    if idx == len(RANKS) - 1:
+        return f"{RANKS[idx]} {'▰' * 5} MAX"
+    prog = pts % 10
+    filled = prog // 2
+    return f"{RANKS[idx]} {'▰' * filled}{'▱' * (5 - filled)} {prog}/10"
+
+MENTION_RE = re.compile(r"<@!?(\d+)>\s*(?:[x×*]\s*)?(\d{1,2})?")
+
+def parse_stat_list(text):
+    """'@tung 2 @bob' -> {tung_id: 2, bob_id: 1}"""
+    out = {}
+    for m in MENTION_RE.finditer(text or ""):
+        uid = int(m.group(1))
+        out[uid] = out.get(uid, 0) + int(m.group(2) or 1)
+    return out
+
+def check_match_stats(fx, hg, ag, goals, assists, cs):
+    """Returns an error string, or None if the stats are consistent with the score."""
+    sides = {fx["home_id"]: (hg, ag), fx["away_id"]: (ag, hg)}   # team -> (scored, conceded)
+    per = {tid: {"g": 0, "a": 0} for tid in sides}
+    for kind, data in (("goals", goals), ("assists", assists), ("cs", cs)):
+        for uid, n in data.items():
+            t = player_team(uid)
+            if not t or t["id"] not in sides:
+                return f"<@{uid}> isn't on either team in this match (check /roster)."
+            scored, conceded = sides[t["id"]]
+            if kind == "goals":
+                per[t["id"]]["g"] += n
+            elif kind == "assists":
+                per[t["id"]]["a"] += n
+            else:
+                if n > 1:
+                    return f"A clean sheet counts once per match (<@{uid}>)."
+                if conceded > 0:
+                    return f"<@{uid}> can't have a clean sheet: {t['name']} conceded {conceded}."
+    for tid, (scored, conceded) in sides.items():
+        if per[tid]["g"] > scored:
+            return f"You listed {per[tid]['g']} goals for {name_of(tid)} but they only scored {scored}."
+        if per[tid]["a"] > scored:
+            return f"You listed {per[tid]['a']} assists for {name_of(tid)} but they only scored {scored} goals."
+    return None
+
+def save_match_stats(fid, goals, assists, cs):
+    for uid in set(goals) | set(assists) | set(cs):
+        t = player_team(uid)
+        db.execute("INSERT OR REPLACE INTO match_stats VALUES(?,?,?,?,?,?)",
+                   (fid, uid, t["id"] if t else None, goals.get(uid, 0), assists.get(uid, 0), cs.get(uid, 0)))
+    db.commit()
 
 def logo(team):
     u = team["logo"] if team else None
@@ -139,27 +263,61 @@ async def setup(i: discord.Interaction, channel: discord.TextChannel):
     set_setting("tx_channel", str(channel.id)); set_setting("guild_id", str(i.guild_id))
     await i.response.send_message(f"✅ Transactions will post in {channel.mention}", ephemeral=True)
 
+LOGO_HELP = ("Use a permanent **direct image link** (ends in .png or .jpg). Upload the image to imgur.com or "
+             "postimages.org, then right-click it and choose *Copy image address*. "
+             "Discord attachment links expire, so they can't be used.")
+
+async def check_logo(url):
+    """Returns (ok, reason). Makes sure the link is a real, reachable image."""
+    if not url.startswith(("http://", "https://")):
+        return False, "it must start with http:// or https://"
+    if "cdn.discordapp.com" in url or "media.discordapp.net" in url:
+        return False, "Discord attachment links expire after a while"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as sess:
+            async with sess.get(url, allow_redirects=True, headers={"User-Agent": "Mozilla/5.0 PitchXBot"}) as r:
+                if r.status != 200:
+                    return False, f"the link returned HTTP {r.status}"
+                ctype = r.headers.get("Content-Type", "")
+                if ctype.startswith("image/svg"):
+                    return False, "SVG images aren't supported, use PNG or JPG"
+                if not ctype.startswith("image/"):
+                    return False, f"that's a web page ({ctype or 'unknown type'}), not a direct image link"
+                return True, None
+    except Exception as ex:
+        return False, f"couldn't reach it ({type(ex).__name__})"
+
 @bot.tree.command(description="Add a team to the league")
 @staff
 async def team_add(i: discord.Interaction, name: str, tier: str = "D-Tier", logo_url: str = None):
-    if logo_url and not logo_url.startswith(("http://", "https://")):
-        return await i.response.send_message("Logo must be a direct image link starting with http:// or https://", ephemeral=True)
+    await i.response.defer(ephemeral=True)
+    if logo_url:
+        ok, why = await check_logo(logo_url)
+        if not ok:
+            return await i.followup.send(f"❌ That logo won't work: {why}.\n{LOGO_HELP}")
     try:
         db.execute("INSERT INTO teams(name,logo,tier) VALUES(?,?,?)", (name, logo_url, tier)); db.commit()
     except sqlite3.IntegrityError:
-        return await i.response.send_message("That team already exists.", ephemeral=True)
-    await i.response.send_message(f"✅ Added **{name}** ({tier})", ephemeral=True)
+        return await i.followup.send("That team already exists.")
+    e = discord.Embed(title=f"✅ Added {name}", description=f"{tier} • Budget {money(START_BUDGET)}", color=GREEN)
+    if logo_url:
+        e.set_thumbnail(url=logo_url)
+    await i.followup.send(embed=e)
 
-@bot.tree.command(description="Set or change a team's logo (image URL)")
+@bot.tree.command(description="Set or change a team's logo (direct image link)")
 @staff
 @app_commands.autocomplete(team=team_ac)
 async def team_logo(i: discord.Interaction, team: str, logo_url: str):
-    if not logo_url.startswith(("http://", "https://")):
-        return await i.response.send_message("Logo must be a direct image link starting with http:// or https://", ephemeral=True)
+    await i.response.defer(ephemeral=True)
     if not get_team(team):
-        return await i.response.send_message("Team not found.", ephemeral=True)
+        return await i.followup.send("Team not found.")
+    ok, why = await check_logo(logo_url)
+    if not ok:
+        return await i.followup.send(f"❌ That logo won't work: {why}.\n{LOGO_HELP}")
     db.execute("UPDATE teams SET logo=? WHERE name=?", (logo_url, team)); db.commit()
-    await i.response.send_message(f"✅ Logo updated for **{team}**", ephemeral=True)
+    e = discord.Embed(title=f"✅ Logo updated for {team}", description="This is how it will look on embeds.", color=GREEN)
+    e.set_thumbnail(url=logo_url)
+    await i.followup.send(embed=e)
 
 @bot.tree.command(description="Remove a team")
 @staff
@@ -184,42 +342,122 @@ async def teams(i: discord.Interaction):
                       description="\n".join(f"**{r['name']}** • {r['tier']} • {r['n']} players" for r in rows))
     await i.response.send_message(embed=e)
 
-@bot.tree.command(description="Show a team's roster")
+@bot.tree.command(description="Show a team's roster with player values")
 @app_commands.autocomplete(team=team_ac)
 async def roster(i: discord.Interaction, team: str):
     t = get_team(team)
     if not t:
         return await i.response.send_message("Team not found.", ephemeral=True)
-    ps = db.execute("SELECT user_id FROM players WHERE team_id=?", (t["id"],)).fetchall()
+    ps = sorted(((p["user_id"], player_value(p["user_id"])) for p in
+                 db.execute("SELECT user_id FROM players WHERE team_id=?", (t["id"],)).fetchall()),
+                key=lambda x: -x[1])
     e = discord.Embed(title=f"{t['name']} Roster", color=PINK,
-                      description="\n".join(f"<@{p['user_id']}>" for p in ps) or "No players signed.")
+                      description="\n".join(f"<@{u}> • {money(v)}" for u, v in ps) or "No players signed.")
+    e.set_footer(text=f"Budget {money(budget_of(t))} • Squad value {money(sum(v for _, v in ps))}")
     if logo(t): e.set_thumbnail(url=logo(t))
     await i.response.send_message(embed=e)
 
-@bot.tree.command(description="View a player's status")
-async def profile(i: discord.Interaction, player: discord.Member = None):
-    player = player or i.user
-    t = player_team(player.id)
-    e = discord.Embed(title=player.display_name, color=PINK)
-    e.add_field(name="Club", value=t["name"] if t else "Free Agent")
-    e.add_field(name="Tier", value=t["tier"] if t else "—")
-    e.set_thumbnail(url=player.display_avatar.url)
+def signed_ts(uid):
+    r = db.execute("SELECT signed_at FROM players WHERE user_id=?", (uid,)).fetchone()
+    try:
+        return dt.datetime.strptime(r["signed_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+def profile_embed(member):
+    uid = member.id
+    t = player_team(uid)
+    g, a, c = player_totals(uid)
+    pts = rank_points(g, a, c)
+    e = discord.Embed(title=f"⚽ {member.display_name} · {LEAGUE_SHORT} Player Card", color=PINK,
+                      description=f"**{rank_line(pts)}**")
+    e.add_field(name="Team", value=t["name"] if t else "Free Agent")
+    e.add_field(name="Transfer value", value=money(player_value(uid)))
+    e.add_field(name="Rank points", value=str(pts))
+    e.add_field(name="⚽ Goals", value=str(g))
+    e.add_field(name="🎯 Assists", value=str(a))
+    e.add_field(name="🧤 Clean sheets", value=str(c))
+    e.add_field(name="📈 Contributions", value=str(g + a))
+    e.add_field(name="🏟️ Tier", value=t["tier"] if t else "—")
+    since = signed_ts(uid) if t else None
+    e.add_field(name="📝 With club since", value=tsf(since, "D") if since else "—")
+    cabinet = db.execute("SELECT title FROM trophies WHERE user_id=? ORDER BY id DESC LIMIT 10", (uid,)).fetchall()
+    e.add_field(name="🏆 Player trophy cabinet", inline=False,
+                value="\n".join(f"🏆 {r['title']}" for r in cabinet) or "No trophies yet")
+    e.set_footer(text=f"{LEAGUE_SHORT} · Every stat moves you closer to the next rank")
+    e.set_thumbnail(url=logo(t) or member.display_avatar.url)
+    return e
+
+@bot.tree.command(description="View a player card: team, value, goals, assists, clean sheets, rank")
+async def profile(i: discord.Interaction, player: discord.Member = None, private: bool = False):
+    await i.response.send_message(embed=profile_embed(player or i.user), ephemeral=private)
+
+@bot.tree.command(description="Give a player a trophy for their cabinet")
+@staff
+async def trophy_give(i: discord.Interaction, player: discord.Member, title: str):
+    db.execute("INSERT INTO trophies(user_id,title) VALUES(?,?)", (player.id, title[:100])); db.commit()
+    await i.response.send_message(f"🏆 Gave {player.mention} **{title[:100]}**.", ephemeral=True)
+
+@bot.tree.command(description="Remove a trophy from a player's cabinet")
+@staff
+async def trophy_remove(i: discord.Interaction, player: discord.Member, title: str):
+    r = db.execute("SELECT id FROM trophies WHERE user_id=? AND lower(title)=lower(?) ORDER BY id DESC LIMIT 1",
+                   (player.id, title)).fetchone()
+    if not r:
+        return await i.response.send_message("That player has no trophy with that exact name.", ephemeral=True)
+    db.execute("DELETE FROM trophies WHERE id=?", (r["id"],)); db.commit()
+    await i.response.send_message(f"🗑️ Removed **{title}** from {player.mention}'s cabinet.", ephemeral=True)
+
+@bot.tree.command(description="Show team budgets and squad values (defaults to your team)")
+@app_commands.autocomplete(team=team_ac)
+async def budget(i: discord.Interaction, team: str = None):
+    if team:
+        t = get_team(team)
+        if not t:
+            return await i.response.send_message("Team not found.", ephemeral=True)
+        rows = [t]
+    else:
+        mine = player_team(i.user.id)
+        rows = [mine] if mine else db.execute("SELECT * FROM teams ORDER BY name").fetchall()
+    if not rows:
+        return await i.response.send_message("No teams yet.", ephemeral=True)
+    lines = []
+    for t in rows:
+        squad = sum(player_value(p["user_id"]) for p in
+                    db.execute("SELECT user_id FROM players WHERE team_id=?", (t["id"],)).fetchall())
+        lines.append(f"**{t['name']}**: 💰 {money(budget_of(t))} • squad value {money(squad)}")
+    e = discord.Embed(title="Team Budgets", color=PINK, description="\n".join(lines)[:4000])
+    if len(rows) == 1 and logo(rows[0]):
+        e.set_thumbnail(url=logo(rows[0]))
     await i.response.send_message(embed=e)
 
+@bot.tree.command(description="Set a team's budget (e.g. 100m)")
+@staff
+@app_commands.autocomplete(team=team_ac)
+async def budget_set(i: discord.Interaction, team: str, amount: str):
+    t, v = get_team(team), parse_money(amount)
+    if not t:
+        return await i.response.send_message("Team not found.", ephemeral=True)
+    if v is None:
+        return await i.response.send_message("Couldn't read that amount. Try `100000000`, `100m` or `750k`.", ephemeral=True)
+    db.execute("UPDATE teams SET budget=? WHERE id=?", (v, t["id"])); db.commit()
+    await i.response.send_message(f"✅ **{t['name']}** budget set to {money(v)}.", ephemeral=True)
+
 # ---------------------------------------------------------------- offers (player must accept)
-def offer_embed(kind, team, from_team):
+def offer_embed(kind, team, from_team, fee=0):
     tail = f"\n\n⏳ This offer expires in {OFFER_HOURS} hours."
+    fee_line = f"\n> 💰 **Fee:** {money(fee)}" if fee else ""
     if kind == "sign":
         title, desc = "📝 You've Got a Contract Offer!", f"**{team['name']}** wants to sign you."
         quote = f"> 🏟️ **Club:** {team['name']}\n> 📋 **Status:** Awaiting your answer"
         ask, logo_team, foot = "Do you want to sign?", team, team
     elif kind == "transfer":
         title, desc = "🔁 You've Got a Transfer Offer!", f"**{team['name']}** wants to bring you in."
-        quote = f"> 🔁 **From:** {from_team['name']}\n> 🏟️ **To:** {team['name']}"
+        quote = f"> 🔁 **From:** {from_team['name']}\n> 🏟️ **To:** {team['name']}{fee_line}"
         ask, logo_team, foot = "Do you want to transfer?", team, team
     elif kind == "loan":
         title, desc = "🔄 You've Got a Loan Offer!", f"**{team['name']}** wants to take you on loan."
-        quote = f"> 🔁 **From:** {from_team['name']}\n> 🏟️ **Loan Club:** {team['name']}"
+        quote = f"> 🔁 **From:** {from_team['name']}\n> 🏟️ **Loan Club:** {team['name']}{fee_line}"
         ask, logo_team, foot = "Do you want to go on loan?", team, team
     else:  # release
         title, desc = "📤 Release Request", f"**{from_team['name']}** wants to release you."
@@ -268,9 +506,9 @@ def offer_view(offer_id):
     return v
 
 def apply_offer(o):
-    """Carry out an accepted offer and return the result embed."""
+    """Carry out an accepted offer (moving money for paid moves) and return the result embed."""
     new, old = team_by_id(o["team_id"]), team_by_id(o["from_team_id"])
-    uid, kind = o["user_id"], o["kind"]
+    uid, kind, fee = o["user_id"], o["kind"], int(o["fee"] or 0)
     if kind == "release":
         db.execute("UPDATE players SET team_id=NULL WHERE user_id=?", (uid,))
         embed = tx_embed("You've Been Released", f"You have been released from **{old['name']}**.",
@@ -280,15 +518,19 @@ def apply_offer(o):
     else:
         db.execute("INSERT OR REPLACE INTO players VALUES(?,?,datetime('now'))", (uid, new["id"]))
         team_id = new["id"]
+        fee_line = f"\n> 💰 **Fee:** {money(fee)}" if fee else ""
+        if kind in ("transfer", "loan") and fee:
+            db.execute("UPDATE teams SET budget=budget-? WHERE id=?", (fee, new["id"]))   # buyer pays
+            db.execute("UPDATE teams SET budget=budget+? WHERE id=?", (fee, old["id"]))   # seller is paid
         if kind == "sign":
             embed = tx_embed("You've Been Signed!", f"You have signed a contract with **{new['name']}**!",
                              f"> 🏟️ **New Club:** {new['name']}\n\nWelcome to the team! ⚽", new)
         elif kind == "transfer":
             embed = tx_embed("Transfer Complete", f"You have been transferred to **{new['name']}**!",
-                             f"> 🔁 **From:** {old['name']}\n> 🏟️ **To:** {new['name']}", new, GREEN)
+                             f"> 🔁 **From:** {old['name']}\n> 🏟️ **To:** {new['name']}{fee_line}", new, GREEN)
         else:
             embed = tx_embed("Loan Complete", f"You are now on loan at **{new['name']}**!",
-                             f"> 🔁 **From:** {old['name']}\n> 🏟️ **Loan Club:** {new['name']}", new, GREEN)
+                             f"> 🔁 **From:** {old['name']}\n> 🏟️ **Loan Club:** {new['name']}{fee_line}", new, GREEN)
     db.execute("INSERT INTO events(kind,user_id,team_id) VALUES(?,?,?)", (kind, uid, team_id))
     db.execute("UPDATE offers SET status='accepted' WHERE id=?", (o["id"],))
     db.commit()
@@ -318,9 +560,13 @@ async def handle_offer(i: discord.Interaction, offer_id: int, accept: bool):
         ok = cur and cur["id"] == o["from_team_id"] and team_by_id(o["team_id"])
     else:
         ok = cur and cur["id"] == o["from_team_id"]
+    why = "⚠️ This offer is no longer valid"
+    if ok and o["kind"] in ("transfer", "loan") and (o["fee"] or 0) > 0:
+        if budget_of(team_by_id(o["team_id"])) < o["fee"]:
+            ok, why = False, "⚠️ The club can't afford this fee anymore"
     if accept and not ok:
         db.execute("UPDATE offers SET status='cancelled' WHERE id=?", (offer_id,)); db.commit()
-        emb.color = discord.Color(RED); emb.set_footer(text="⚠️ This offer is no longer valid")
+        emb.color = discord.Color(RED); emb.set_footer(text=why)
         return await i.response.edit_message(embed=emb, view=None)
 
     guild = bot.get_guild(o["guild_id"])
@@ -349,19 +595,20 @@ async def handle_offer(i: discord.Interaction, offer_id: int, accept: bool):
         try: await staff_user.send(f"✅ <@{o['user_id']}> **accepted** the {o['kind']} offer.")
         except discord.HTTPException: pass
 
-async def send_offer(i: discord.Interaction, player: discord.Member, kind: str, team, from_team):
+async def send_offer(i: discord.Interaction, player: discord.Member, kind: str, team, from_team, fee=0):
     db.execute("UPDATE offers SET status='cancelled' WHERE user_id=? AND status='pending'", (player.id,))
-    cur = db.execute("""INSERT INTO offers(user_id,kind,team_id,from_team_id,staff_id,guild_id,created_at)
-                        VALUES(?,?,?,?,?,?,?)""",
+    cur = db.execute("""INSERT INTO offers(user_id,kind,team_id,from_team_id,staff_id,guild_id,created_at,fee)
+                        VALUES(?,?,?,?,?,?,?,?)""",
                      (player.id, kind, team["id"] if team else None,
-                      from_team["id"] if from_team else None, i.user.id, i.guild_id, time.time()))
+                      from_team["id"] if from_team else None, i.user.id, i.guild_id, time.time(), fee))
     db.commit()
     oid = cur.lastrowid
-    embed, view = offer_embed(kind, team, from_team), offer_view(oid)
+    embed, view = offer_embed(kind, team, from_team, fee), offer_view(oid)
     tname = team["name"] if team else ""
     fname = from_team["name"] if from_team else ""
-    what = {"sign": f"sign with **{tname}**", "transfer": f"transfer to **{tname}**",
-            "loan": f"go on loan to **{tname}**", "release": f"be released from **{fname}**"}[kind]
+    fee_txt = f" for **{money(fee)}**" if fee else ""
+    what = {"sign": f"sign with **{tname}**", "transfer": f"transfer to **{tname}**{fee_txt}",
+            "loan": f"go on loan to **{tname}**{fee_txt}", "release": f"be released from **{fname}**"}[kind]
 
     try:
         await asyncio.wait_for(player.send(embed=embed, view=view), timeout=15)
@@ -465,10 +712,12 @@ async def sign(i: discord.Interaction, player: discord.Member, team: str = None)
         return await i.followup.send("That player already has a team. Use /transfer to bring them in.")
     await send_offer(i, player, "sign", t, None)
 
-@bot.tree.command(description="Offer a player a transfer to your team (they must accept)")
+@bot.tree.command(description="Offer a player a paid transfer to your team (they must accept)")
 @staff_or_manager
+@app_commands.describe(fee="What you'll pay their club, e.g. 5000000, 5m or 750k",
+                       to_team="Your team (optional if you manage just one)")
 @app_commands.autocomplete(to_team=my_team_ac)
-async def transfer(i: discord.Interaction, player: discord.Member, to_team: str = None):
+async def transfer(i: discord.Interaction, player: discord.Member, fee: str, to_team: str = None):
     await i.response.defer(ephemeral=True)
     new, err = resolve_team(i, to_team)
     if err:
@@ -480,12 +729,24 @@ async def transfer(i: discord.Interaction, player: discord.Member, to_team: str 
         return await i.followup.send("That player is a free agent. Use /sign.")
     if cur["id"] == new["id"]:
         return await i.followup.send("They're already on that team.")
-    await send_offer(i, player, "transfer", new, cur)
+    amount = parse_money(fee)
+    if amount is None:
+        return await i.followup.send("Couldn't read that fee. Try `5000000`, `5m` or `750k`.")
+    left = budget_of(new)
+    if amount > left:
+        return await i.followup.send(f"❌ **{new['name']}** only has {money(left)} left. You offered {money(amount)}.")
+    value = player_value(player.id)
+    minimum = int(value * MIN_FEE_PERCENT / 100)
+    if amount < minimum:
+        return await i.followup.send(f"❌ The minimum fee for {player.mention} is {money(minimum)} (their market value is {money(value)}).")
+    await send_offer(i, player, "transfer", new, cur, amount)
 
 @bot.tree.command(description="Offer a player a loan move to your team (they must accept)")
 @staff_or_manager
+@app_commands.describe(to_team="Your team (optional if you manage just one)",
+                       fee="Optional loan fee paid to their club, e.g. 500k (default 0)")
 @app_commands.autocomplete(to_team=my_team_ac)
-async def loan(i: discord.Interaction, player: discord.Member, to_team: str = None):
+async def loan(i: discord.Interaction, player: discord.Member, to_team: str = None, fee: str = "0"):
     await i.response.defer(ephemeral=True)
     new, err = resolve_team(i, to_team)
     if err:
@@ -495,7 +756,12 @@ async def loan(i: discord.Interaction, player: discord.Member, to_team: str = No
         return await i.followup.send("You can't loan a bot.")
     if not cur or cur["id"] == new["id"]:
         return await i.followup.send("Player needs a different current team to be loaned out.")
-    await send_offer(i, player, "loan", new, cur)
+    amount = parse_money(fee)
+    if amount is None:
+        return await i.followup.send("Couldn't read that fee. Try `500k` or leave it empty.")
+    if amount > budget_of(new):
+        return await i.followup.send(f"❌ **{new['name']}** only has {money(budget_of(new))} left.")
+    await send_offer(i, player, "loan", new, cur, amount)
 
 @bot.tree.command(description="Ask a player to be released (they must accept)")
 @staff
@@ -634,13 +900,17 @@ def h2h_text(me_id, opp_id):
             f"Last: {name_of(last['home_id'])} {last['home_goals']}–{last['away_goals']} {name_of(last['away_id'])}")
 
 def next_fixture(team_id):
-    return db.execute("""SELECT * FROM fixtures WHERE status='scheduled' AND (home_id=? OR away_id=?)
-                         AND kickoff > ? ORDER BY kickoff LIMIT 1""", (team_id, team_id, time.time() - 7200)).fetchone()
+    q = """SELECT * FROM fixtures WHERE status='scheduled' AND (home_id=? OR away_id=?) {} ORDER BY kickoff LIMIT 1"""
+    f = db.execute(q.format("AND kickoff > ?"), (team_id, team_id, time.time() - 7200)).fetchone()
+    return f or db.execute(q.format(""), (team_id, team_id)).fetchone()   # fall back to an overdue, unplayed fixture
 
 def next_match_line(team, f):
     home = f["home_id"] == team["id"]
     opp = name_of(f["away_id"] if home else f["home_id"])
-    return f"**{opp}** ({'H' if home else 'A'}) • {tsf(f['kickoff'])} ({tsf(f['kickoff'], 'R')})"
+    line = f"**{opp}** ({'H' if home else 'A'}) • {tsf(f['kickoff'])} ({tsf(f['kickoff'], 'R')})"
+    if f["kickoff"] < time.time() - 7200:
+        line += "\n⚠️ **Overdue**: past its date with no result yet (staff: /schedule_shift or /result)."
+    return line
 
 def table_block(rows):
     lines = [f"{'#':>2}  {'Team':<14} {'P':>2} {'W':>2} {'D':>2} {'L':>2} {'GD':>3} {'Pts':>3}"]
@@ -651,7 +921,7 @@ def table_block(rows):
 
 # ---------------------------------------------------------------- matchday briefs (auto + manual)
 def brief_text():
-    return get_setting("brief_text") or "Goals (2 pts), assists (2 pts)."
+    return get_setting("brief_text") or "Goals ⚽ (2 pts), assists 🎯 (2 pts), clean sheets 🧤 (2 pts)."
 
 def matchday_embed(fx, me, opp, is_home):
     tier = fx["tier"] or me["tier"]
@@ -859,7 +1129,10 @@ async def fixtures_cmd(i: discord.Interaction, team: str = None, tier: str = Non
     rows = db.execute(q + " ORDER BY kickoff LIMIT ?", args + [limit]).fetchall()
     if not rows:
         return await i.response.send_message("No upcoming fixtures.", ephemeral=True)
-    lines = [f"`#{f['id']}` GW{f['gw']} • **{name_of(f['home_id'])}** vs **{name_of(f['away_id'])}** • {tsf(f['kickoff'])}" for f in rows]
+    lines = [("⚠️ " if f["kickoff"] < time.time() - 7200 else "") +
+             f"`#{f['id']}` GW{f['gw']} • **{name_of(f['home_id'])}** vs **{name_of(f['away_id'])}** • {tsf(f['kickoff'])}" for f in rows]
+    if any(f["kickoff"] < time.time() - 7200 for f in rows):
+        lines.append("\n⚠️ = past its date with no result yet")
     await i.response.send_message(embed=discord.Embed(title=f"{LEAGUE_SHORT} Fixtures", color=ORANGE, description="\n".join(lines)))
 
 @bot.tree.command(description="Show a team's next match (defaults to your team)")
@@ -882,7 +1155,7 @@ def save_result(fid, hg, ag, notes=None, forfeit=0):
     db.execute("""UPDATE fixtures SET status='played', home_goals=?, away_goals=?, notes=?, played_at=?, forfeit=?
                   WHERE id=?""", (hg, ag, notes, time.time(), forfeit, fid)); db.commit()
 
-def result_embed(fx):
+def result_embed(fx, changes=None):
     h, a = team_by_id(fx["home_id"]), team_by_id(fx["away_id"])
     hg, ag = fx["home_goals"], fx["away_goals"]
     win = h if hg > ag else a if ag > hg else None
@@ -897,6 +1170,15 @@ def result_embed(fx):
     lines = [f"> {t['name']}: **{ordinal(pos[t['id']]['pos'])}** ({pos[t['id']]['pts']} pts)" for t in (h, a) if t["id"] in pos]
     if lines:
         e.add_field(name="📊 League position", value="\n".join(lines), inline=False)
+    st = db.execute("SELECT * FROM match_stats WHERE fixture_id=?", (fx["id"],)).fetchall()
+    for col, emoji, label in (("goals", "⚽", "Goals"), ("assists", "🎯", "Assists"), ("clean_sheets", "🧤", "Clean sheets")):
+        parts = [f"<@{r['user_id']}>" + (f" ×{r[col]}" if r[col] > 1 else "") for r in st if r[col] > 0]
+        if parts:
+            e.add_field(name=f"{emoji} {label}", value=", ".join(parts), inline=False)
+    if changes:
+        ups = [f"<@{u}>: {money(b)} → {money(n)} (+{money(n - b)})" for u, b, n in changes if n > b][:10]
+        if ups:
+            e.add_field(name="📈 Market value", value="\n".join(ups), inline=False)
     if fx["notes"] and not fx["forfeit"]:
         e.add_field(name="📝 Notes", value=f"> {fx['notes']}", inline=False)
     if win and logo(win):
@@ -904,50 +1186,83 @@ def result_embed(fx):
     e.set_footer(text=f"{fx['competition'] or 'League'} • {tier}")
     return e
 
-async def announce_result(fx):
+async def announce_result(fx, changes=None):
     guild = get_guild()
     ch = chan(guild, "results_channel") or chan(guild, "matchday_channel")
     if not ch:
         return "(No results channel set. Use /setchannel.)"
     try:
-        await asyncio.wait_for(ch.send(embed=result_embed(fx)), timeout=15)
+        await asyncio.wait_for(ch.send(embed=result_embed(fx, changes)), timeout=15)
         return f"Posted in {ch.mention}."
     except Exception as ex:
         print(f"[result] post failed: {ex!r}")
         return f"(Couldn't post in {ch.mention}: {type(ex).__name__}.)"
 
-@bot.tree.command(name="result", description="Enter the result of a scheduled match")
+def read_stats(scorers, assists, clean_sheets):
+    """Returns (goals, assists, cs, error)."""
+    out = []
+    for raw, label in ((scorers, "scorers"), (assists, "assists"), (clean_sheets, "clean_sheets")):
+        parsed = parse_stat_list(raw)
+        if raw and not parsed:
+            return None, None, None, f"I couldn't find any @mentions in **{label}**. Type @ and pick each player from the list."
+        out.append(parsed)
+    return out[0], out[1], out[2], None
+
+STAT_HELP = dict(scorers="Who scored ⚽ e.g. @tung 2 @bob (number after a name = goals, default 1)",
+                 assists="Who assisted 🎯 e.g. @bob 1 @tung",
+                 clean_sheets="Who kept a clean sheet 🧤 e.g. @keeper @defender")
+
+@bot.tree.command(name="result", description="Enter a match result, with scorers, assists and clean sheets")
 @staff
+@app_commands.describe(**STAT_HELP, notes="Optional note shown on the result")
 @app_commands.autocomplete(fixture=sched_ac)
 async def result_cmd(i: discord.Interaction, fixture: str,
                      home_score: app_commands.Range[int, 0, 99], away_score: app_commands.Range[int, 0, 99],
-                     notes: str = None):
+                     scorers: str = None, assists: str = None, clean_sheets: str = None, notes: str = None):
     await i.response.defer(ephemeral=True)
     fx = get_fx(fixture)
     if not fx:
         return await i.followup.send("Fixture not found. Pick one from the list.")
     if fx["status"] == "played":
         return await i.followup.send("That fixture already has a result. Use /result_remove first.")
+    goals, ast_, cs, err = read_stats(scorers, assists, clean_sheets)
+    err = err or check_match_stats(fx, home_score, away_score, goals or {}, ast_ or {}, cs or {})
+    if err:
+        return await i.followup.send(f"❌ {err}\nNothing was saved.")
+    ids = set(goals) | set(ast_) | set(cs)
+    before = {u: player_value(u) for u in ids}
     save_result(fx["id"], home_score, away_score, notes)
+    save_match_stats(fx["id"], goals, ast_, cs)
+    changes = [(u, before[u], player_value(u)) for u in ids]
     fx = get_fx(fx["id"])
-    where = await announce_result(fx)
+    where = await announce_result(fx, changes)
     await i.followup.send(f"✅ Saved: **{name_of(fx['home_id'])} {home_score}–{away_score} {name_of(fx['away_id'])}**. {where}")
 
 @bot.tree.command(description="Record a result for a match that wasn't scheduled (friendly, make-up game)")
 @staff
+@app_commands.describe(**STAT_HELP)
 @app_commands.autocomplete(home=team_ac, away=team_ac)
 async def result_add(i: discord.Interaction, home: str, away: str,
                      home_score: app_commands.Range[int, 0, 99], away_score: app_commands.Range[int, 0, 99],
+                     scorers: str = None, assists: str = None, clean_sheets: str = None,
                      gameweek: int = 0, notes: str = None):
     await i.response.defer(ephemeral=True)
     h, a = get_team(home), get_team(away)
     if not h or not a or h["id"] == a["id"]:
         return await i.followup.send("Pick two different, existing teams.")
-    now = time.time()
+    goals, ast_, cs, err = read_stats(scorers, assists, clean_sheets)
+    err = err or check_match_stats({"home_id": h["id"], "away_id": a["id"]}, home_score, away_score,
+                                   goals or {}, ast_ or {}, cs or {})
+    if err:
+        return await i.followup.send(f"❌ {err}\nNothing was saved.")
+    ids = set(goals) | set(ast_) | set(cs)
+    before = {u: player_value(u) for u in ids}
     cur = db.execute("""INSERT INTO fixtures(gw,home_id,away_id,kickoff,tier,competition,brief_sent)
-                        VALUES(?,?,?,?,?,?,1)""", (gameweek, h["id"], a["id"], now, h["tier"], "League"))
+                        VALUES(?,?,?,?,?,?,1)""", (gameweek, h["id"], a["id"], time.time(), h["tier"], "League"))
     save_result(cur.lastrowid, home_score, away_score, notes)
-    where = await announce_result(get_fx(cur.lastrowid))
+    save_match_stats(cur.lastrowid, goals, ast_, cs)
+    changes = [(u, before[u], player_value(u)) for u in ids]
+    where = await announce_result(get_fx(cur.lastrowid), changes)
     await i.followup.send(f"✅ Saved: **{h['name']} {home_score}–{away_score} {a['name']}**. {where}")
 
 @bot.tree.command(description="Award a forfeit win (3-0) for a scheduled match")
@@ -972,6 +1287,7 @@ async def result_remove(i: discord.Interaction, fixture: str):
     fx = get_fx(fixture)
     if not fx or fx["status"] != "played":
         return await i.response.send_message("Played fixture not found.", ephemeral=True)
+    db.execute("DELETE FROM match_stats WHERE fixture_id=?", (fx["id"],))
     db.execute("""UPDATE fixtures SET status='scheduled', home_goals=NULL, away_goals=NULL, notes=NULL,
                   played_at=NULL, forfeit=0 WHERE id=?""", (fx["id"],)); db.commit()
     await i.response.send_message(f"↩️ Result removed. Fixture #{fx['id']} is back on the schedule.", ephemeral=True)
@@ -1052,12 +1368,143 @@ async def freeagents(i: discord.Interaction):
     desc = "\n".join(f"<@{r['user_id']}>" for r in rows[:60]) or "No free agents right now."
     await i.response.send_message(embed=discord.Embed(title="Free Agents", color=PINK, description=desc))
 
+# ---------------------------------------------------------------- /table (logo image, private)
+_logo_cache = {}
+
+async def fetch_logo(url):
+    if not url:
+        return None
+    if url in _logo_cache:
+        return _logo_cache[url]
+    data = None
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as sess:
+            async with sess.get(url, headers={"User-Agent": "Mozilla/5.0 PitchXBot"}) as r:
+                if r.status == 200 and r.headers.get("Content-Type", "").startswith("image/"):
+                    data = await r.read()
+    except Exception as ex:
+        print(f"[table] logo fetch failed: {ex!r}")
+    if data and len(data) < 5_000_000:
+        _logo_cache[url] = data
+        return data
+    return None
+
+def _font(size, bold=False):
+    names = ("DejaVuSans-Bold.ttf", "arialbd.ttf") if bold else ("DejaVuSans.ttf", "arial.ttf")
+    for n in names:
+        try:
+            return ImageFont.truetype(n, size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.load_default(size)
+    except TypeError:
+        return ImageFont.load_default()
+
+def _put(d, xy, text, font, fill, anchor="lm"):
+    try:
+        d.text(xy, text, font=font, fill=fill, anchor=anchor)
+    except ValueError:
+        d.text(xy, text, font=font, fill=fill)
+
+def render_table(title, rows, logos, highlight_id=None):
+    W, ROW, HEAD = 940, 64, 104
+    rows = rows[:30]
+    img = Image.new("RGB", (W, HEAD + ROW * len(rows) + 24), (30, 31, 34))
+    d = ImageDraw.Draw(img)
+    f_title, f_head, f_name, f_num = _font(34, True), _font(18, True), _font(26, True), _font(24)
+    grey = (150, 152, 157)
+    cols = [("P", 590), ("W", 650), ("D", 710), ("L", 770), ("GD", 835), ("PTS", 900)]
+    _put(d, (32, 38), title, f_title, (255, 255, 255))
+    _put(d, (36, HEAD - 14), "#", f_head, grey, "mm")
+    _put(d, (130, HEAD - 14), "TEAM", f_head, grey, "lm")
+    for label, x in cols:
+        _put(d, (x, HEAD - 14), label, f_head, grey, "mm")
+    for n, r in enumerate(rows):
+        y0 = HEAD + n * ROW
+        cy = y0 + ROW // 2
+        t = r["team"]
+        fill = (54, 57, 99) if t["id"] == highlight_id else (38, 40, 44) if n % 2 == 0 else (30, 31, 34)
+        d.rectangle((0, y0, W, y0 + ROW - 1), fill=fill)
+        accent = {0: (250, 204, 21), 1: (203, 213, 225), 2: (217, 119, 6)}.get(n)
+        if accent:
+            d.rectangle((0, y0, 5, y0 + ROW - 1), fill=accent)
+        _put(d, (36, cy), str(r["pos"]), f_num, (255, 255, 255), "mm")
+        box, lx = 48, 66
+        ly, drawn = cy - box // 2, False
+        if logos[n]:
+            try:
+                im = Image.open(io.BytesIO(logos[n])).convert("RGBA")
+                im.thumbnail((box, box))
+                img.paste(im, (lx + (box - im.width) // 2, ly + (box - im.height) // 2), im)
+                drawn = True
+            except Exception:
+                pass
+        if not drawn:
+            d.ellipse((lx, ly, lx + box, ly + box), fill=(64, 68, 75))
+            _put(d, (lx + box // 2, cy), t["name"][:1].upper(), f_name, (255, 255, 255), "mm")
+        name = t["name"]
+        if d.textlength(name, font=f_name) > 400:
+            while len(name) > 3 and d.textlength(name + "…", font=f_name) > 400:
+                name = name[:-1]
+            name = name.rstrip() + "…"
+        _put(d, (130, cy), name, f_name, (255, 255, 255), "lm")
+        vals = {"P": r["p"], "W": r["w"], "D": r["d"], "L": r["l"], "GD": f"{r['gf'] - r['ga']:+d}", "PTS": r["pts"]}
+        for label, x in cols:
+            _put(d, (x, cy), str(vals[label]), f_name if label == "PTS" else f_num, (255, 255, 255), "mm")
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+@bot.tree.command(name="table", description="League table with every team's logo and position (only you see it)")
+@app_commands.autocomplete(tier=tier_ac)
+async def table_cmd(i: discord.Interaction, tier: str = None):
+    await i.response.defer(ephemeral=True)
+    if Image is None:
+        return await i.followup.send("❌ Pillow isn't installed on the host, so I can't draw the table. Add `Pillow` to requirements.txt.")
+    tiers = [tier] if tier else [r["tier"] for r in db.execute(
+        "SELECT DISTINCT tier FROM teams WHERE tier IS NOT NULL ORDER BY tier").fetchall()]
+    mine = player_team(i.user.id)
+    files = []
+    for n, tr in enumerate(tiers[:10]):
+        rows = standings(tr)
+        if not rows:
+            continue
+        logos = await asyncio.gather(*(fetch_logo(logo(r["team"])) for r in rows[:30]))
+        png = await asyncio.to_thread(render_table, f"{LEAGUE_SHORT} Table • {tr}", rows, logos, mine["id"] if mine else None)
+        files.append(discord.File(io.BytesIO(png), filename=f"table_{n + 1}.png"))
+    if not files:
+        return await i.followup.send("No teams yet.")
+    await i.followup.send(files=files)
+
+@bot.tree.command(description="Move ALL scheduled fixtures of a tier so the first one starts at a new date/time")
+@staff
+@app_commands.autocomplete(tier=tier_ac)
+async def schedule_shift(i: discord.Interaction, tier: str, new_start: str):
+    await i.response.defer(ephemeral=True)
+    d = parse_dt(new_start)
+    if not d:
+        return await i.followup.send(f"Couldn't read that time. {TIME_HELP}")
+    rows = db.execute("SELECT id, kickoff FROM fixtures WHERE tier=? AND status='scheduled' ORDER BY kickoff", (tier,)).fetchall()
+    if not rows:
+        return await i.followup.send(f"No scheduled fixtures in **{tier}**.")
+    tz = league_tz()
+    first = dt.datetime.fromtimestamp(rows[0]["kickoff"], tz)
+    days = (d.date() - first.date()).days
+    minutes = (d.hour * 60 + d.minute) - (first.hour * 60 + first.minute)
+    for r in rows:
+        new = dt.datetime.fromtimestamp(r["kickoff"], tz) + dt.timedelta(days=days, minutes=minutes)
+        db.execute("UPDATE fixtures SET kickoff=?, brief_sent=0 WHERE id=?", (new.timestamp(), r["id"]))
+    db.commit()
+    await i.followup.send(f"📅 Moved **{len(rows)}** fixtures in **{tier}**. GW1 now starts {tsf(d.timestamp())}.")
+
 # ---------------------------------------------------------------- settings
 @bot.tree.command(description="Choose where the bot posts: transactions, matchdays or results")
 @staff
 @app_commands.choices(kind=[app_commands.Choice(name="Transactions", value="tx_channel"),
                             app_commands.Choice(name="Matchdays", value="matchday_channel"),
-                            app_commands.Choice(name="Results", value="results_channel")])
+                            app_commands.Choice(name="Results", value="results_channel"),
+                            app_commands.Choice(name="Bot logs (errors)", value="log_channel")])
 async def setchannel(i: discord.Interaction, kind: app_commands.Choice[str], channel: discord.TextChannel):
     set_setting(kind.value, str(channel.id)); set_setting("guild_id", str(i.guild_id))
     await i.response.send_message(f"✅ **{kind.name}** will post in {channel.mention}", ephemeral=True)
@@ -1077,6 +1524,48 @@ async def timezone(i: discord.Interaction, name: str):
 async def brief(i: discord.Interaction, text: str):
     set_setting("brief_text", text[:500])
     await i.response.send_message("✅ Matchday brief updated.", ephemeral=True)
+
+@bot.tree.command(description="Check the bot's setup and find problems")
+@staff
+async def health(i: discord.Interaction):
+    await i.response.defer(ephemeral=True)
+    g, me = i.guild, i.guild.me
+    lines = []
+    for key, label in (("tx_channel", "Transactions"), ("matchday_channel", "Matchdays"),
+                       ("results_channel", "Results"), ("log_channel", "Bot logs")):
+        ch = chan(g, key)
+        if not ch:
+            lines.append(f"⚠️ **{label}** channel not set (/setchannel)")
+            continue
+        p = ch.permissions_for(me)
+        missing = [n for n, v in (("View Channel", p.view_channel), ("Send Messages", p.send_messages),
+                                  ("Embed Links", p.embed_links)) if not v]
+        lines.append(f"{'❌' if missing else '✅'} **{label}**: {ch.mention}"
+                     + (f" (bot is missing: {', '.join(missing)})" if missing else ""))
+    teams_ = db.execute("SELECT name, logo FROM teams ORDER BY name").fetchall()
+    targets = [("League logo", LEAGUE_LOGO)] if LEAGUE_LOGO else []
+    targets += [(f"{t['name']} logo", t["logo"]) for t in teams_ if t["logo"]][:25]
+    checked = await asyncio.gather(*(check_logo(u) for _, u in targets))
+    for (label, _), (ok_, why) in zip(targets, checked):
+        lines.append(f"{'✅' if ok_ else '❌'} {label}" + ("" if ok_ else f": {why}. Fix with /team_logo"))
+    if not LEAGUE_LOGO:
+        lines.append("⚠️ League logo not set or invalid (LEAGUE_LOGO_URL)")
+    if Image is None:
+        lines.append("❌ Pillow isn't installed, so /table can't draw. Add Pillow to requirements.txt.")
+    nologo = [t["name"] for t in teams_ if not t["logo"]]
+    if nologo:
+        lines.append(f"⚠️ No logo yet: {', '.join(nologo[:10])}")
+    one = lambda q: db.execute(q).fetchone()[0]
+    stats = (f"{one('SELECT COUNT(*) FROM teams')} teams • "
+             f"{one('SELECT COUNT(*) FROM players WHERE team_id IS NOT NULL')} rostered players • "
+             f"{one('SELECT COUNT(*) FROM managers')} managers • "
+             f"{one('SELECT COUNT(*) FROM fixtures WHERE status=' + chr(39) + 'scheduled' + chr(39))} scheduled fixtures")
+    lines.append(f"📊 {stats}")
+    lines.append(f"🕒 Timezone: {getattr(league_tz(), 'key', 'UTC')} • discord.py {discord.__version__}")
+    if not get_setting("staff_role"):
+        lines.append("ℹ️ No staff role set (/staffrole). Admins and Manage Server can still use staff commands.")
+    await i.followup.send(embed=discord.Embed(title="PitchX health check", color=PINK,
+                                              description="\n".join(lines)[:4000]))
 
 # ---------------------------------------------------------------- league reminders (every 2 weeks)
 REMINDER_KINDS = ["next", "rivals", "pulse"]
@@ -1165,6 +1654,14 @@ async def staffrole(i: discord.Interaction, role: discord.Role):
     set_setting("staff_role", str(role.id))
     await i.response.send_message(f"✅ Members with {role.mention} can now use staff commands.", ephemeral=True)
 
+async def log_error(where, err):
+    ch = chan(get_guild(), "log_channel")
+    if ch:
+        try:
+            await ch.send(f"⚠️ `/{where}` failed: `{type(err).__name__}: {str(err)[:600]}`")
+        except Exception:
+            pass
+
 @bot.tree.error
 async def on_app_error(i: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CheckFailure):
@@ -1175,6 +1672,7 @@ async def on_app_error(i: discord.Interaction, error: app_commands.AppCommandErr
     else:
         orig = getattr(error, "original", error)
         traceback.print_exception(type(orig), orig, orig.__traceback__)
+        await log_error(i.command.name if i.command else "command", orig)
         msg = f"⚠️ Something went wrong: {type(orig).__name__}: {str(orig)[:200]}"
     try:
         if i.response.is_done():

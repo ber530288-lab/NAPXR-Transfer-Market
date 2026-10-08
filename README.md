@@ -52,3 +52,23 @@ Players must allow DMs from server members (Server > Privacy Settings) to receiv
 - Managers can use `/sign`, `/transfer` and `/loan` **for their own team only** (leave the team box empty and the bot
   uses it automatically). The player still gets an Accept / Decline DM, and the manager is told their answer.
 - `/release`, results, schedule and setup stay staff-only.
+
+## Logos
+Logo links must be permanent **direct image links** (end in .png/.jpg). Upload to imgur.com or postimages.org and use
+*Copy image address*. Discord attachment links expire, so the bot refuses them. `/team_logo` and `/team_add` now test the
+link before saving. Run **/health** any time to test every logo, the channels and the bot's permissions.
+Set `/setchannel Bot logs` to get command errors posted in a staff channel.
+
+## Economy, stats and player cards
+- Every team starts with **$100,000,000** (`START_BUDGET`). `/budget` shows budgets, `/budget_set` (staff) changes one.
+- `/transfer player fee` needs a fee (`5000000`, `5m`, `750k`). The buyer must afford it, and it must be at least the
+  player's market value (`MIN_FEE_PERCENT`). When the player accepts, the buyer pays and the selling team receives it.
+  `/loan` takes an optional fee. `/sign` (free agents) is free.
+- `/result fixture home_score away_score scorers assists clean_sheets`: tag players with @ and put a number after a name
+  for several (`@tung 2 @bob`). The bot checks the numbers against the score (no more goals than the team scored, assists
+  can't exceed goals, clean sheets only if the opponent scored 0). Nothing is saved if a check fails.
+- Player market value: $500k base, +$600k per goal ⚽, +$350k per assist 🎯, +$400k per clean sheet 🧤, half rate past
+  $6M, capped at $20M. Rank points: 2 per goal/assist/clean sheet, 10 points per rank step.
+- `/profile` is a player card (team logo, value, rank, stats, trophies). `/trophy_give` and `/trophy_remove` manage the cabinet.
+- `/table` draws the league table as an image with every team's logo, visible only to you.
+- `/schedule_shift tier new_start` moves a whole schedule (fixes a wrong start date).
