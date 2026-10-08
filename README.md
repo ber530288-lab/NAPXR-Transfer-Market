@@ -32,3 +32,23 @@ Staff commands require the **Manage Server** permission.
 - **Staff commands**: usable by Administrators, anyone with Manage Server, the server owner, or the role set with `/staffrole`. Everyone can see the commands; non-staff just get a "Staff only" message.
 - **Errors**: any failure now replies with the error name, and the full traceback prints in the host console.
 - **Bot can't post**: give it View Channel, Send Messages and Embed Links in the transactions channel.
+
+## League system (schedule, results, records)
+1. `/setchannel` for **Matchdays** and **Results** (and Transactions). Also run `/timezone America/New_York` (or yours).
+2. Build the schedule: `/schedule_generate tier:D-Tier start:2026-10-12 20:00 days_between:7 legs:2`
+   (round-robin for every team in that tier), or add games one by one with `/schedule_add`.
+3. **Matchday is automatic**: 24h before kickoff (`MATCHDAY_LEAD_HOURS`) the bot DMs each rostered player a brief with
+   their live league position, form, head-to-head and kickoff time, posts a public card in the matchday channel,
+   and pings anyone whose DMs are closed there. `/matchday` re-sends one manually.
+4. After the game: `/result fixture home_score away_score` (winner and table update automatically and the result
+   posts in the results channel). Also `/forfeit`, `/result_add` (unscheduled games), `/result_remove` (undo).
+5. Everyone: `/standings`, `/fixtures`, `/results`, `/nextmatch`, `/record`, `/h2h`, `/freeagents`.
+6. Staff: `/schedule_move`, `/schedule_remove`, `/schedule_clear`, `/brief` (text of the matchday brief).
+
+Players must allow DMs from server members (Server > Privacy Settings) to receive briefs by DM.
+
+## Team managers (so teams can sign their own players)
+- Staff run `/manager_add team:@user` for each team owner/captain. `/manager_remove` and `/managers` to undo/list.
+- Managers can use `/sign`, `/transfer` and `/loan` **for their own team only** (leave the team box empty and the bot
+  uses it automatically). The player still gets an Accept / Decline DM, and the manager is told their answer.
+- `/release`, results, schedule and setup stay staff-only.
