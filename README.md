@@ -26,3 +26,9 @@ Staff commands require the **Manage Server** permission.
    DISCORD_TOKEN, GUILD_ID, LEAGUE_LOGO_URL, PROFILE_URL
 5. Start the bot. Keep `pitchx.db` in place - it holds your teams and rosters.
    Back it up before reinstalling or wiping the server.
+
+## Troubleshooting
+- **Commands show twice**: set `GUILD_ID` in your variables, restart once. The bot removes the duplicate copies on startup.
+- **Staff commands**: usable by Administrators, anyone with Manage Server, the server owner, or the role set with `/staffrole`. Everyone can see the commands; non-staff just get a "Staff only" message.
+- **Errors**: any failure now replies with the error name, and the full traceback prints in the host console.
+- **Bot can't post**: give it View Channel, Send Messages and Embed Links in the transactions channel.

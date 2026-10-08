@@ -3,6 +3,7 @@ import os
 import re
 import sqlite3
 import time
+import traceback
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -13,9 +14,12 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")
 LEAGUE_NAME = os.getenv("LEAGUE_NAME", "VCL X NAPXR.GG | PitchX")
 LEAGUE_SHORT = os.getenv("LEAGUE_SHORT", "PitchX")
-LEAGUE_LOGO = os.getenv("LEAGUE_LOGO_URL") or None
+def _url(v):
+    return v if v and v.startswith(("http://", "https://")) else None
+
+LEAGUE_LOGO = _url(os.getenv("LEAGUE_LOGO_URL"))
 PROFILE_URL = os.getenv("PROFILE_URL", "https://discord.com/users/{user_id}")
-DASHBOARD_URL = os.getenv("DASHBOARD_URL") or None
+DASHBOARD_URL = _url(os.getenv("DASHBOARD_URL"))
 REMINDER_DAYS = float(os.getenv("REMINDER_DAYS", "14"))
 OFFER_HOURS = 48
 
@@ -26,6 +30,10 @@ FORM = {"W": "🟢", "D": "🟡", "L": "🔴"}
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "pitchx.db"))
 db = sqlite3.connect(DB_PATH)
 db.row_factory = sqlite3.Row
+try:
+    db.execute('PRAGMA journal_mode=WAL'); db.execute('PRAGMA synchronous=NORMAL')
+except sqlite3.Error:
+    pass
 db.executescript("""
 CREATE TABLE IF NOT EXISTS teams(
   id INTEGER PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE, logo TEXT, tier TEXT);
@@ -78,6 +86,10 @@ def dashboard_view():
     v.add_item(discord.ui.Button(label="Open Your Dashboard", emoji="🏟️", url=DASHBOARD_URL))
     return v
 
+def logo(team):
+    u = team["logo"] if team else None
+    return u if u and u.startswith(("http://", "https://")) else None
+
 def footer_text(team):
     return f"{team['tier']} | {team['name']} • {LEAGUE_SHORT}" if team else LEAGUE_SHORT
 
@@ -85,8 +97,8 @@ def tx_embed(title, desc, quote, team, color=PINK):
     e = discord.Embed(title=title, description=f"{desc}\n\n{quote}", color=color,
                       timestamp=discord.utils.utcnow())
     e.set_author(name=f"{LEAGUE_SHORT} Transactions", icon_url=LEAGUE_LOGO)
-    if team and team["logo"]:
-        e.set_thumbnail(url=team["logo"])
+    if logo(team):
+        e.set_thumbnail(url=logo(team))
     return e
 
 async def post_tx(guild, embed, user_id, content=None):
@@ -96,7 +108,20 @@ async def post_tx(guild, embed, user_id, content=None):
         await ch.send(content=content, embed=embed, view=profile_view(user_id))
     return ch
 
-staff = app_commands.default_permissions(manage_guild=True)
+def is_staff_member(m):
+    p = m.guild_permissions
+    if p.administrator or p.manage_guild or m.id == m.guild.owner_id:
+        return True
+    rid = get_setting("staff_role")
+    return bool(rid) and any(r.id == int(rid) for r in m.roles)
+
+async def _staff_pred(i: discord.Interaction):
+    if i.guild and isinstance(i.user, discord.Member) and is_staff_member(i.user):
+        return True
+    raise app_commands.CheckFailure("not staff")
+
+# Runtime check (not hidden by Discord), so admins and the staff role can always use these.
+staff = app_commands.check(_staff_pred)
 
 # ---------------------------------------------------------------- setup / teams
 @bot.tree.command(description="Set the channel where transactions are posted")
@@ -108,6 +133,8 @@ async def setup(i: discord.Interaction, channel: discord.TextChannel):
 @bot.tree.command(description="Add a team to the league")
 @staff
 async def team_add(i: discord.Interaction, name: str, tier: str = "D-Tier", logo_url: str = None):
+    if logo_url and not logo_url.startswith(("http://", "https://")):
+        return await i.response.send_message("Logo must be a direct image link starting with http:// or https://", ephemeral=True)
     try:
         db.execute("INSERT INTO teams(name,logo,tier) VALUES(?,?,?)", (name, logo_url, tier)); db.commit()
     except sqlite3.IntegrityError:
@@ -118,6 +145,8 @@ async def team_add(i: discord.Interaction, name: str, tier: str = "D-Tier", logo
 @staff
 @app_commands.autocomplete(team=team_ac)
 async def team_logo(i: discord.Interaction, team: str, logo_url: str):
+    if not logo_url.startswith(("http://", "https://")):
+        return await i.response.send_message("Logo must be a direct image link starting with http:// or https://", ephemeral=True)
     if not get_team(team):
         return await i.response.send_message("Team not found.", ephemeral=True)
     db.execute("UPDATE teams SET logo=? WHERE name=?", (logo_url, team)); db.commit()
@@ -153,7 +182,7 @@ async def roster(i: discord.Interaction, team: str):
     ps = db.execute("SELECT user_id FROM players WHERE team_id=?", (t["id"],)).fetchall()
     e = discord.Embed(title=f"{t['name']} Roster", color=PINK,
                       description="\n".join(f"<@{p['user_id']}>" for p in ps) or "No players signed.")
-    if t["logo"]: e.set_thumbnail(url=t["logo"])
+    if logo(t): e.set_thumbnail(url=logo(t))
     await i.response.send_message(embed=e)
 
 @bot.tree.command(description="View a player's status")
@@ -189,8 +218,8 @@ def offer_embed(kind, team, from_team):
                       color=PINK, timestamp=discord.utils.utcnow())
     e.set_author(name=f"{LEAGUE_SHORT} Transactions", icon_url=LEAGUE_LOGO)
     e.set_footer(text=footer_text(foot))
-    if logo_team["logo"]:
-        e.set_thumbnail(url=logo_team["logo"])
+    if logo(logo_team):
+        e.set_thumbnail(url=logo(logo_team))
     return e
 
 class OfferButton(discord.ui.DynamicItem[discord.ui.Button],
@@ -209,6 +238,17 @@ class OfferButton(discord.ui.DynamicItem[discord.ui.Button],
 
     async def callback(self, interaction: discord.Interaction):
         await handle_offer(interaction, self.offer_id, self.action == "accept")
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        traceback.print_exception(type(error), error, error.__traceback__)
+        msg = f"⚠️ Something went wrong: {type(error).__name__}: {str(error)[:200]}"
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except discord.HTTPException:
+            pass
 
 def offer_view(offer_id):
     v = discord.ui.View(timeout=None)
@@ -307,68 +347,76 @@ async def send_offer(i: discord.Interaction, player: discord.Member, kind: str, 
     db.commit()
     oid = cur.lastrowid
     embed, view = offer_embed(kind, team, from_team), offer_view(oid)
-    what = {"sign": f"sign with **{team['name'] if team else ''}**",
-            "transfer": f"transfer to **{team['name'] if team else ''}**",
-            "loan": f"go on loan to **{team['name'] if team else ''}**",
-            "release": f"be released from **{from_team['name'] if from_team else ''}**"}[kind]
+    tname = team["name"] if team else ""
+    fname = from_team["name"] if from_team else ""
+    what = {"sign": f"sign with **{tname}**", "transfer": f"transfer to **{tname}**",
+            "loan": f"go on loan to **{tname}**", "release": f"be released from **{fname}**"}[kind]
+
     try:
-        await player.send(embed=embed, view=view)
-        await i.followup.send(f"📨 Offer sent to {player.mention} to {what}. Waiting for their answer.")
-    except (discord.Forbidden, discord.HTTPException):
-        ch_id = get_setting("tx_channel")
-        ch = i.guild.get_channel(int(ch_id)) if ch_id else None
-        if ch:
-            await ch.send(content=player.mention, embed=embed, view=view)
-            await i.followup.send(f"📨 Offer for {player.mention} to {what} (couldn't DM them, posted in {ch.mention})")
-        else:
-            db.execute("UPDATE offers SET status='cancelled' WHERE id=?", (oid,)); db.commit()
-            await i.followup.send(f"❌ Couldn't DM {player.mention} and no transactions channel is set (/setup).")
+        await asyncio.wait_for(player.send(embed=embed, view=view), timeout=15)
+        return await i.followup.send(f"📨 Offer sent to {player.mention} to {what}. Waiting for their answer.")
+    except Exception as ex:
+        print(f"[offer] DM to {player.id} failed: {ex!r}")
+
+    reason = "no transactions channel is set (use /setup)"
+    ch_id = get_setting("tx_channel")
+    ch = i.guild.get_channel(int(ch_id)) if ch_id else None
+    if ch:
+        try:
+            await asyncio.wait_for(ch.send(content=player.mention, embed=embed, view=view), timeout=15)
+            return await i.followup.send(
+                f"📨 Offer for {player.mention} to {what} (couldn't DM them, posted in {ch.mention})")
+        except Exception as ex:
+            print(f"[offer] channel post failed: {ex!r}")
+            reason = f"I can't post in {ch.mention} ({type(ex).__name__}). Check my channel permissions"
+    db.execute("UPDATE offers SET status='cancelled' WHERE id=?", (oid,)); db.commit()
+    await i.followup.send(f"❌ Couldn't DM {player.mention} and {reason}.")
 
 @bot.tree.command(description="Offer a free agent a contract (they must accept)")
 @staff
 @app_commands.autocomplete(team=team_ac)
 async def sign(i: discord.Interaction, player: discord.Member, team: str):
+    await i.response.defer(ephemeral=True)
     t = get_team(team)
     if not t:
-        return await i.response.send_message("Team not found. Use /team_add first.", ephemeral=True)
+        return await i.followup.send("Team not found. Use /team_add first.")
     if player_team(player.id):
-        return await i.response.send_message("That player already has a team. Use /transfer or /release.", ephemeral=True)
-    await i.response.defer(ephemeral=True)
+        return await i.followup.send("That player already has a team. Use /transfer or /release.")
     await send_offer(i, player, "sign", t, None)
 
 @bot.tree.command(description="Offer a player a transfer to another team (they must accept)")
 @staff
 @app_commands.autocomplete(to_team=team_ac)
 async def transfer(i: discord.Interaction, player: discord.Member, to_team: str):
+    await i.response.defer(ephemeral=True)
     new, cur = get_team(to_team), player_team(player.id)
     if not new:
-        return await i.response.send_message("Team not found.", ephemeral=True)
+        return await i.followup.send("Team not found.")
     if not cur:
-        return await i.response.send_message("That player is a free agent. Use /sign.", ephemeral=True)
+        return await i.followup.send("That player is a free agent. Use /sign.")
     if cur["id"] == new["id"]:
-        return await i.response.send_message("They're already on that team.", ephemeral=True)
-    await i.response.defer(ephemeral=True)
+        return await i.followup.send("They're already on that team.")
     await send_offer(i, player, "transfer", new, cur)
 
 @bot.tree.command(description="Offer a player a loan move (they must accept)")
 @staff
 @app_commands.autocomplete(to_team=team_ac)
 async def loan(i: discord.Interaction, player: discord.Member, to_team: str):
+    await i.response.defer(ephemeral=True)
     new, cur = get_team(to_team), player_team(player.id)
     if not new:
-        return await i.response.send_message("Team not found.", ephemeral=True)
+        return await i.followup.send("Team not found.")
     if not cur or cur["id"] == new["id"]:
-        return await i.response.send_message("Player needs a different current team to be loaned out.", ephemeral=True)
-    await i.response.defer(ephemeral=True)
+        return await i.followup.send("Player needs a different current team to be loaned out.")
     await send_offer(i, player, "loan", new, cur)
 
 @bot.tree.command(description="Ask a player to be released (they must accept)")
 @staff
 async def release(i: discord.Interaction, player: discord.Member):
+    await i.response.defer(ephemeral=True)
     cur = player_team(player.id)
     if not cur:
-        return await i.response.send_message("That player isn't on a team.", ephemeral=True)
-    await i.response.defer(ephemeral=True)
+        return await i.followup.send("That player isn't on a team.")
     await send_offer(i, player, "release", None, cur)
 
 # ---------------------------------------------------------------- matchday
@@ -383,8 +431,8 @@ def matchday_embed(gw, me, opp, is_home, competition, tier, me_pos, me_pts, opp_
         f"> You: **{me_pos}** ({me_pts} pts) {f(me_form)}\n> Them: **{opp_pos}** ({opp_pts} pts) {f(opp_form)}")
     e.add_field(name="⚔️ Head to head", inline=False, value=f"> {h2h}")
     e.add_field(name="💡 Your matchday brief", inline=False, value=f"> {brief}")
-    e.set_footer(text=f"{me['name']} • {tier}", icon_url=me["logo"] or None)
-    if me["logo"]: e.set_thumbnail(url=me["logo"])
+    e.set_footer(text=f"{me['name']} • {tier}", icon_url=logo(me))
+    if logo(me): e.set_thumbnail(url=logo(me))
     return e
 
 @bot.tree.command(description="Send matchday briefs to both teams' players")
@@ -488,20 +536,58 @@ async def reminder_now(i: discord.Interaction, kind: app_commands.Choice[str]):
     sent, failed = await send_reminders(kind.value)
     await i.followup.send(f"📨 Reminder sent: {sent} DMs, {failed} failed.")
 
+@bot.tree.command(description="Set the role that can use staff commands (admins always can)")
+@staff
+async def staffrole(i: discord.Interaction, role: discord.Role):
+    if not i.user.guild_permissions.manage_guild:
+        return await i.response.send_message("Only admins can change the staff role.", ephemeral=True)
+    set_setting("staff_role", str(role.id))
+    await i.response.send_message(f"✅ Members with {role.mention} can now use staff commands.", ephemeral=True)
+
+@bot.tree.error
+async def on_app_error(i: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        msg = "🚫 Staff only. You need Administrator, Manage Server, or the staff role (/staffrole)."
+    else:
+        orig = getattr(error, "original", error)
+        traceback.print_exception(type(orig), orig, orig.__traceback__)
+        msg = f"⚠️ Something went wrong: {type(orig).__name__}: {str(orig)[:200]}"
+    try:
+        if i.response.is_done():
+            await i.followup.send(msg, ephemeral=True)
+        else:
+            await i.response.send_message(msg, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
 @bot.event
 async def setup_hook():
     bot.add_dynamic_items(OfferButton)
     reminder_loop.start()
     if GUILD_ID:
+        # server-only commands (appear instantly); wipe the global copies that cause duplicates
         g = discord.Object(int(GUILD_ID))
         bot.tree.copy_global_to(guild=g)
         await bot.tree.sync(guild=g)
+        bot.tree.clear_commands(guild=None)
+        await bot.tree.sync()
     else:
         await bot.tree.sync()
 
+_cleaned = False
+
 @bot.event
 async def on_ready():
+    global _cleaned
     print(f"Logged in as {bot.user}")
+    if not GUILD_ID and not _cleaned:   # remove old per-server copies that cause duplicates
+        _cleaned = True
+        for g in bot.guilds:
+            bot.tree.clear_commands(guild=g)
+            try:
+                await bot.tree.sync(guild=g)
+            except discord.HTTPException:
+                pass
 
 if not TOKEN:
     raise SystemExit("DISCORD_TOKEN is not set. Add it in your host's environment/variables panel or in a .env file.")
