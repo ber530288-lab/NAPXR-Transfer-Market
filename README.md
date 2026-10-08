@@ -10,7 +10,8 @@
 ## First steps in your server
 - `/setup #transactions`
 - `/team_add name:Elite Manchester United tier:D-Tier`  (logo_url optional, add later with `/team_logo`)
-- `/sign @player team` · `/release @player` · `/transfer @player team`
+- `/sign`, `/transfer`, `/loan`, `/release` send the player an **Accept / Decline** DM. Nothing changes until they accept; then the result embed posts in the transactions channel. Offers expire after 48h.
+- Every 14 days the bot DMs all rostered players a league reminder, rotating: Who You're Playing Next → Rivals Making Moves → Weekly Pulse. Test with `/reminder_now`.
 - `/matchday gameweek:3 home:... away:...` → DMs every rostered player a brief
 - `/teams`, `/roster`, `/profile` for everyone
 
