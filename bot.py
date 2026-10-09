@@ -56,6 +56,8 @@ FORM = {"W": "🟢", "D": "🟡", "L": "🔴"}
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "pitchx.db"))
 BACKUP_DIR = os.getenv("BACKUP_DIR", os.path.join(os.path.dirname(DB_PATH), "backups"))
 BACKUP_KEEP = int(os.getenv("BACKUP_KEEP", "30"))
+BACKUP_CHANNEL_NAME = "pitchx-backups"
+AUTO_BACKUP_CHANNEL = os.getenv("AUTO_BACKUP_CHANNEL", "1") == "1"   # create a private #pitchx-backups channel if missing
 
 def _count(path, table="teams"):
     """Row count of a table in a database file, read-only (0 if missing/unreadable). Never creates the file."""
@@ -144,6 +146,9 @@ ensure_schema()
 print(f"[db] {DB_PATH}: {db.execute('SELECT COUNT(*) FROM teams').fetchone()[0]} teams, "
       f"{db.execute('SELECT COUNT(*) FROM players').fetchone()[0]} players, "
       f"{db.execute('SELECT COUNT(*) FROM fixtures').fetchone()[0]} fixtures loaded")
+STARTED_EMPTY = db.execute("SELECT COUNT(*) FROM teams").fetchone()[0] == 0
+if STARTED_EMPTY:
+    print(f"[db] WARNING: empty database at {DB_PATH}. If you had teams before, this file was replaced or you started the bot from a new folder.")
 
 def backup_db(tag="auto"):
     """Consistent snapshot of the live database into BACKUP_DIR; keeps the newest BACKUP_KEEP."""
@@ -657,17 +662,19 @@ def render_cabinet(items):
                 pass
         if not drawn:
             d.ellipse((cx - 45, y0 + 13, cx + 45, y0 + 103), fill=(250, 204, 21))
-            _put(d, (cx, y0 + 58), "★", f_star, (30, 31, 34), "mm")
-        name = it["name"]
+            d.polygon([(cx + (34 if k % 2 == 0 else 14) * math.cos(-math.pi / 2 + k * math.pi / 5),
+                       y0 + 58 + (34 if k % 2 == 0 else 14) * math.sin(-math.pi / 2 + k * math.pi / 5)) for k in range(10)],
+                      fill=(30, 31, 34))
+        name = ascii_img(it["name"])
         if d.textlength(name, font=f_name) > SW - 10:
-            while len(name) > 3 and d.textlength(name + "…", font=f_name) > SW - 10:
+            while len(name) > 3 and d.textlength(name + "...", font=f_name) > SW - 10:
                 name = name[:-1]
-            name = name.rstrip() + "…"
+            name = name.rstrip() + "..."
         _put(d, (cx, y0 + 138), name, f_name, (255, 255, 255), "mm")
         if it["n"] > 1:
             bx, by = cx + 34, y0 + 8
             d.ellipse((bx, by, bx + 42, by + 42), fill=(88, 101, 242))
-            _put(d, (bx + 21, by + 21), f"×{it['n']}", f_badge, (255, 255, 255), "mm")
+            _put(d, (bx + 21, by + 21), f"x{it['n']}", f_badge, (255, 255, 255), "mm")
     buf = io.BytesIO()
     img.save(buf, "PNG")
     return buf.getvalue()
@@ -1452,12 +1459,13 @@ def _draw_name(d, xy, text, max_w, anchor):
             return
     f = _font(20, True)
     t = text
-    while len(t) > 2 and d.textlength(t + "…", font=f) > max_w:
+    while len(t) > 2 and d.textlength(t + "...", font=f) > max_w:
         t = t[:-1]
-    _put(d, (x, y), t.rstrip() + "…", f, white, anchor)
+    _put(d, (x, y), t.rstrip() + "...", f, white, anchor)
 
 def render_banner(h_name, a_name, center, h_logo, a_logo):
     """[LOGO] HOME  1 – 1  AWAY [LOGO]  (center is the score or 'VS')"""
+    h_name, a_name, center = ascii_img(h_name), ascii_img(a_name), ascii_img(center)
     W, H, LB = 960, 220, 150
     img = Image.new("RGB", (W, H), (43, 45, 49))
     d = ImageDraw.Draw(img)
@@ -1792,7 +1800,7 @@ async def announce_result(fx, changes=None):
         return "(No results channel set. Use /setchannel.)"
     try:
         h, a = team_by_id(fx["home_id"]), team_by_id(fx["away_id"])
-        png = await make_banner(h, a, f"{fx['home_goals']} – {fx['away_goals']}")
+        png = await make_banner(h, a, f"{fx['home_goals']} - {fx['away_goals']}")
         embeds, files = with_banner(result_embed(fx, changes, bool(png)), png)
         await asyncio.wait_for(ch.send(embeds=embeds, **banner_kw(files)), timeout=20)
         return f"Posted in {ch.mention}."
@@ -2061,13 +2069,23 @@ def _font(size, bold=False):
     except TypeError:
         return ImageFont.load_default()
 
+_IMG_MAP = str.maketrans({"•": "-", "·": "-", "–": "-", "—": "-", "…": "...", "×": "x", "★": "*",
+                          "’": "'", "‘": "'", "“": '"', "”": '"', "→": ">", "\u00a0": " "})
+
+def ascii_img(text):
+    """Text for generated images: plain keyboard characters for punctuation, and nothing the host font can't draw."""
+    out = "".join(c for c in str(text).translate(_IMG_MAP) if ord(c) < 0x250)
+    return " ".join(out.split()) or "?"
+
 def _put(d, xy, text, font, fill, anchor="lm", **kw):
+    text = ascii_img(text)
     try:
         d.text(xy, text, font=font, fill=fill, anchor=anchor, **kw)
     except ValueError:
         d.text(xy, text, font=font, fill=fill, **kw)
 
 def render_table(title, rows, logos, highlight_id=None, div_logo=None):
+    title = ascii_img(title)
     W, ROW, HEAD = 940, 64, 104
     rows = rows[:30]
     img = Image.new("RGB", (W, HEAD + ROW * len(rows) + 24), (30, 31, 34))
@@ -2108,12 +2126,12 @@ def render_table(title, rows, logos, highlight_id=None, div_logo=None):
                 pass
         if not drawn:
             d.ellipse((lx, ly, lx + box, ly + box), fill=(64, 68, 75))
-            _put(d, (lx + box // 2, cy), t["name"][:1].upper(), f_name, (255, 255, 255), "mm")
-        name = t["name"]
+            _put(d, (lx + box // 2, cy), ascii_img(t["name"])[:1].upper(), f_name, (255, 255, 255), "mm")
+        name = ascii_img(t["name"])
         if d.textlength(name, font=f_name) > 400:
-            while len(name) > 3 and d.textlength(name + "…", font=f_name) > 400:
+            while len(name) > 3 and d.textlength(name + "...", font=f_name) > 400:
                 name = name[:-1]
-            name = name.rstrip() + "…"
+            name = name.rstrip() + "..."
         _put(d, (130, cy), name, f_name, (255, 255, 255), "lm")
         vals = {"P": r["p"], "W": r["w"], "D": r["d"], "L": r["l"], "GD": f"{r['gf'] - r['ga']:+d}", "PTS": r["pts"]}
         for label, x in cols:
@@ -2145,7 +2163,7 @@ async def table_cmd(i: discord.Interaction, tier: str = None):
             continue
         logos = await asyncio.gather(*(team_logo_bytes(r["team"]) for r in rows[:30]))   # stored copies: no downloads
         div = db.execute("SELECT logo FROM divisions WHERE name=?", (tr,)).fetchone()
-        title, hl, dlogo = f"{league_short()} Table • {tr}", (mine["id"] if mine else None), (div["logo"] if div else None)
+        title, hl, dlogo = f"{league_short()} Table - {tr}", (mine["id"] if mine else None), (div["logo"] if div else None)
         key = _table_key(title, rows, logos, hl, dlogo)
         png = _table_cache.get(key)
         if png is None:                                  # only redraw when results/logos actually changed
@@ -2252,8 +2270,12 @@ async def health(i: discord.Interaction):
              f"{one('SELECT COUNT(*) FROM managers')} managers • "
              f"{one('SELECT COUNT(*) FROM fixtures WHERE status=' + chr(39) + 'scheduled' + chr(39))} scheduled fixtures")
     nb = len(glob.glob(os.path.join(BACKUP_DIR, "pitchx-*.db")))
-    lines.append(f"💾 Data file: `{DB_PATH}` ({os.path.getsize(DB_PATH) // 1024} KB) • {nb} local backups"
-                 + ("" if chan(g, "backup_channel") else " • ⚠️ no Discord backup channel (/setchannel Backups)"))
+    last = float(get_setting("last_backup_post") or 0)
+    bch = chan(g, "backup_channel")
+    lines.append(f"💾 Data file: `{DB_PATH}` ({os.path.getsize(DB_PATH) // 1024} KB, changed {tsf(os.path.getmtime(DB_PATH), 'R')}) • {nb} local backups")
+    lines.append((f"✅ Off-host backup in {bch.mention}, last posted {tsf(last, 'R')}" if bch and last else
+                  f"⚠️ No off-host backup yet. I'll create **#{BACKUP_CHANNEL_NAME}** (needs Manage Channels), or make that channel yourself.")
+                 + ("\n⚠️ This run STARTED WITH AN EMPTY DATABASE." if STARTED_EMPTY else ""))
     lines.append(f"📊 {stats}")
     lines.append(f"🕒 Timezone: {getattr(league_tz(), 'key', 'UTC')} • discord.py {discord.__version__}")
     if not get_setting("staff_role"):
@@ -2340,9 +2362,131 @@ async def reminder_now(i: discord.Interaction, kind: app_commands.Choice[str]):
     sent, failed = await send_reminders(kind.value)
     await i.followup.send(f"📨 Reminder sent: {sent} DMs, {failed} failed.")
 
+async def notify_owner(guild, text):
+    try:
+        owner = guild.owner or await guild.fetch_member(guild.owner_id)
+        await owner.send(text)
+    except Exception:
+        pass
+    ch = chan(guild, "log_channel")
+    if ch:
+        try:
+            await ch.send(text)
+        except Exception:
+            pass
+
+async def find_backup_channel(guild, create=False):
+    """The private channel holding database backups: saved setting, BACKUP_CHANNEL_ID, a channel named #pitchx-backups, or a new one."""
+    ch = chan(guild, "backup_channel")
+    if not ch:
+        cid = os.getenv("BACKUP_CHANNEL_ID", "")
+        ch = guild.get_channel(int(cid)) if cid.isdigit() else None
+    if not ch:
+        ch = discord.utils.get(guild.text_channels, name=BACKUP_CHANNEL_NAME)
+    if not ch and create and AUTO_BACKUP_CHANNEL and guild.me.guild_permissions.manage_channels:
+        try:
+            ow = {guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                  guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True,
+                                                        read_message_history=True, manage_messages=True)}
+            ch = await guild.create_text_channel(BACKUP_CHANNEL_NAME, overwrites=ow, reason="PitchX automatic database backups",
+                                                 topic="Automatic PitchX database backups. Keep this channel private.")
+        except Exception as ex:
+            print(f"[backup] couldn't create the backup channel: {ex!r}")
+            ch = None
+    if ch and get_setting("backup_channel") != str(ch.id):
+        set_setting("backup_channel", str(ch.id))
+    return ch
+
+async def post_backup(path, guild=None):
+    """Copy the database file into the private backup channel (off the host). Keeps the newest 30."""
+    guild = guild or get_guild()
+    if not guild or os.path.getsize(path) >= 9_000_000:
+        return False
+    ch = await find_backup_channel(guild, create=True)
+    if not ch:
+        if time.time() - float(get_setting("backup_warned") or 0) > 86400:
+            set_setting("backup_warned", str(time.time()))
+            await notify_owner(guild, f"⚠️ I can't keep an off-host backup of your league data. Create a private channel named "
+                                      f"**#{BACKUP_CHANNEL_NAME}** (or give me **Manage Channels**) so updates can never wipe your teams.")
+        return False
+    try:
+        await ch.send(f"💾 {league_short()} database backup • {discord.utils.utcnow():%Y-%m-%d %H:%M} UTC",
+                      file=discord.File(path, filename="pitchx.db"))
+        set_setting("last_backup_post", str(time.time()))
+    except Exception as ex:
+        print(f"[backup] posting the backup failed: {ex!r}")
+        return False
+    try:
+        mine = [m async for m in ch.history(limit=200) if m.author.id == bot.user.id and m.attachments]
+        for m in mine[30:]:
+            await m.delete()
+    except Exception as ex:
+        print(f"[backup] cleanup failed: {ex!r}")
+    return True
+
+async def restore_from_discord(guild):
+    """If the database is empty, load the newest valid backup from the backup channel. Returns the number of teams restored (0 = none)."""
+    ch = await find_backup_channel(guild, create=False)
+    if not ch:
+        return 0
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    tmp = os.path.join(BACKUP_DIR, "from-discord.tmp")
+    try:
+        async for m in ch.history(limit=100):
+            if m.author.id != bot.user.id:
+                continue
+            for a in m.attachments:
+                if a.filename != "pitchx.db" or a.size > 50_000_000:
+                    continue
+                try:
+                    await a.save(tmp)
+                    chk = sqlite3.connect(tmp)
+                    try:
+                        tables = {r[0] for r in chk.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                        if not {"teams", "players", "settings"} <= tables:
+                            continue
+                        n = chk.execute("SELECT COUNT(*) FROM teams").fetchone()[0]
+                        if n == 0:
+                            continue
+                        chk.backup(db)
+                    finally:
+                        chk.close()
+                    ensure_schema()
+                    return n
+                except sqlite3.DatabaseError:
+                    continue
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    return 0
+
+async def startup_data_check():
+    """Runs once after login: if the bot woke up with NO data, bring it back from Discord (or say loudly that it can't)."""
+    await asyncio.sleep(3)
+    try:
+        if db.execute("SELECT COUNT(*) FROM teams").fetchone()[0] > 0:
+            return
+        if os.getenv("AUTO_RESTORE", "1") == "1":
+            for guild in bot.guilds:
+                n = await restore_from_discord(guild)
+                if n:
+                    print(f"[db] Database was empty: restored {n} teams from the Discord backup channel")
+                    await notify_owner(guild, f"♻️ The bot started with an EMPTY database, so I restored **{n}** teams "
+                                              f"(plus players, budgets, fixtures, results, trophies and settings) from the latest backup.")
+                    return
+        print(f"[db] ⚠️ EMPTY database at {DB_PATH} and no Discord backup found")
+        for guild in bot.guilds:
+            await notify_owner(guild, f"⚠️ The bot started with an **empty database** (`{DB_PATH}`) and found no backup to restore. "
+                                      "If you had teams before, your host replaced or wiped the data file (or started the bot from a new folder). "
+                                      "Upload your last backup with `/restore`, and set `DB_PATH` to a folder that survives updates.")
+    except Exception:
+        traceback.print_exc()
+
 @tasks.loop(hours=6)
 async def backup_loop():
-    """Backs up at every start and every 6h; posts a copy to the backup channel about once a day."""
+    """Backs up at every start and every 6h: a local copy, plus a copy in the private Discord backup channel."""
     try:
         if db.execute("SELECT COUNT(*) FROM teams").fetchone()[0] == 0:
             return   # never rotate good backups out because of an empty database
@@ -2350,17 +2494,7 @@ async def backup_loop():
     except Exception:
         traceback.print_exc()
         return
-    ch = chan(get_guild(), "backup_channel")
-    if ch and time.time() - float(get_setting("last_backup_post") or 0) >= 20 * 3600:
-        try:
-            if os.path.getsize(path) < 9_000_000:
-                await ch.send(f"💾 {league_short()} database backup • {discord.utils.utcnow():%Y-%m-%d %H:%M} UTC",
-                              file=discord.File(path, filename="pitchx.db"))
-                set_setting("last_backup_post", str(time.time()))
-            else:
-                await ch.send("⚠️ The database is too big to attach here. Use /backup to download it.")
-        except Exception as ex:
-            print(f"[backup] channel post failed: {ex!r}")
+    await post_backup(path)
 
 @backup_loop.before_loop
 async def _wait_bk():
@@ -2617,6 +2751,8 @@ def dominant_color(png):
 
 def render_here_we_go(avatar, from_logo, to_logo, title, sub, from_label, bg=None, to_label=None):
     """Stadium + tifo (new club's crest on it, BEHIND the player's photo) + [old club] >>> [new club]."""
+    title, from_label, to_label = ascii_img(title), (ascii_img(from_label) if from_label else None), (ascii_img(to_label) if to_label else None)
+    sub = ascii_img(sub) if sub else ""
     W, H, S = 1280, 720, 250
     img = stadium_background(W, H, bg).convert("RGBA")
     d = ImageDraw.Draw(img)
@@ -2710,7 +2846,7 @@ async def make_here_we_go(kind, user, new, old, fee=0):
         row = db.execute("SELECT data FROM assets WHERE name='transfer_bg'").fetchone()
         title = {"transfer": "HERE WE GO!", "sign": "OFFICIAL", "loan": "LOAN DEAL"}.get(kind, "OFFICIAL")
         name = clean_text(user.display_name) or clean_text(getattr(user, "name", ""))
-        sub = " • ".join(x for x in (name, money(fee) if fee else "") if x)
+        sub = " - ".join(x for x in (name, money(fee) if fee else "") if x)
         return await run_render(render_here_we_go, avatar, from_logo, to_logo, title, sub,
                                 old["name"] if old else None, row["data"] if row else None, new["name"])
     except Exception as ex:
@@ -3319,11 +3455,15 @@ async def setup_hook():
         await bot.tree.sync()
 
 _cleaned = False
+_startup_checked = False
 
 @bot.event
 async def on_ready():
-    global _cleaned
+    global _cleaned, _startup_checked
     print(f"Logged in as {bot.user}")
+    if not _startup_checked:
+        _startup_checked = True
+        asyncio.create_task(startup_data_check())
     if not GUILD_ID and not _cleaned:   # remove old per-server copies that cause duplicates
         _cleaned = True
         for g in bot.guilds:
