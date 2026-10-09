@@ -98,3 +98,16 @@ Safety nets (automatic):
 
 If the data ever looks reset after an update, it usually means the bot was started from a *new folder* (new empty database).
 Fix: set `DB_PATH` to one fixed location in your variables, or run `/restore` with your latest backup file.
+
+## Uploads, divisions, banners and transfer history (latest update)
+- **Image uploads, no links:** `/team_add`, `/team_logo`, `/make_division`, `/division_logo`, `/make_trophy` all have an `image`
+  box: just upload the picture. The bot keeps its own permanent copy (links still work as a fallback). Teams that only had a logo
+  link are converted to stored copies automatically on the first start.
+- **Divisions:** admins run `/make_division name` (optionally upload a logo). `/team_add name division` puts a team in one.
+  Existing tiers were turned into divisions automatically. `/divisions`, `/division_logo`, `/division_delete`.
+  The division logo shows on `/table` and `/standings`.
+- **Logos next to names:** results, matchday briefs/announcements, `/nextmatch` and `/h2h` now show a banner:
+  `[RMA logo] RMA  1 – 1  BARCA [BARCA logo]` (`VS` before the game).
+- **Transfers:** the price paid becomes the player's market value (bought for $100M = worth $100M; later goals/assists add on top).
+  The public post says who bought whom and for how much, and `/budget` shows spent, received, and who each team bought/sold.
+- **Name:** embeds say NAPXR. Change it any time with `/league_name` (admins).
