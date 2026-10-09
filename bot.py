@@ -2,6 +2,9 @@ import asyncio
 import functools
 import glob
 import io
+import math
+import random
+import threading
 import pathlib
 import aiohttp
 import os
@@ -17,7 +20,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 except ImportError:   # /table needs Pillow
     Image = None
 
@@ -44,6 +47,7 @@ ASSIST_VALUE = int(os.getenv("ASSIST_VALUE", "350000"))
 CLEANSHEET_VALUE = int(os.getenv("CLEANSHEET_VALUE", "400000"))
 VALUE_SOFT_CAP = int(os.getenv("VALUE_SOFT_CAP", "6000000"))       # past this, extra output adds value at half rate
 MAX_PLAYER_VALUE = int(os.getenv("MAX_PLAYER_VALUE", "20000000"))
+SIGN_VALUE_BONUS = int(os.getenv("SIGN_VALUE_BONUS", "500000"))   # value added when a free agent signs for a team
 
 PINK, ORANGE, GREEN, YELLOW, RED = 0xE91E63, 0xF57C00, 0x2ECC71, 0xF1C40F, 0xE74C3C
 FORM = {"W": "🟢", "D": "🟡", "L": "🔴"}
@@ -102,6 +106,7 @@ CREATE TABLE IF NOT EXISTS fixtures(
   id INTEGER PRIMARY KEY, gw INTEGER, home_id INTEGER, away_id INTEGER, kickoff REAL, tier TEXT,
   competition TEXT, status TEXT DEFAULT 'scheduled', home_goals INTEGER, away_goals INTEGER,
   notes TEXT, brief_sent INTEGER DEFAULT 0, played_at REAL, forfeit INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS assets(name TEXT PRIMARY KEY, data BLOB);
 CREATE TABLE IF NOT EXISTS divisions(
   id INTEGER PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE, logo BLOB, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS transfers(
@@ -381,11 +386,11 @@ def tx_embed(title, desc, quote, team, color=PINK):
         e.set_thumbnail(url=logo(team))
     return e
 
-async def post_tx(guild, embed, user_id, content=None):
+async def post_tx(guild, embed, user_id, content=None, files=None):
     ch_id = get_setting("tx_channel")
     ch = guild.get_channel(int(ch_id)) if guild and ch_id else None
     if ch:
-        await ch.send(content=content, embed=embed, view=profile_view(user_id))
+        await ch.send(content=content, embed=embed, view=profile_view(user_id), **({"files": files} if files else {}))
     return ch
 
 def is_staff_member(m):
@@ -509,6 +514,9 @@ async def team_add(i: discord.Interaction, name: str, division: str,
     e = discord.Embed(title=f"✅ Added {t['name']}", color=GREEN,
                       description=f"{t['tier']} • Budget {money(START_BUDGET)}"
                       + ("" if png else "\nNo logo yet. Add one with `/team_logo` (upload an image)."))
+    role = find_team_role(i.guild, t["name"])
+    e.description += (f"\nRole: {role.mention}" if role else
+                      f"\n⚠️ No role containing **{t['name']}** exists yet. Create one (e.g. `NAPXR | {t['name']}`) and players get it automatically.")
     if logo(t):
         e.set_thumbnail(url=logo(t))
     await i.followup.send(embed=e)
@@ -678,7 +686,7 @@ async def profile(i: discord.Interaction, player: discord.Member = None, private
     e = profile_embed(member, cabinet)
     kw = {}
     if cabinet and Image is not None:
-        png = await asyncio.to_thread(render_cabinet, cabinet)
+        png = await run_render(render_cabinet, cabinet)
         kw["file"] = discord.File(io.BytesIO(png), filename="cabinet.png")
         e.set_image(url="attachment://cabinet.png")     # shows right under the trophy cabinet
     await i.followup.send(embed=e, **kw)
@@ -934,7 +942,7 @@ def apply_offer(o):
         elif kind == "loan":
             bonus = player_bonus(uid)
         else:
-            bonus = 0
+            bonus = SIGN_VALUE_BONUS            # signing for a club raises a free agent's value
         db.execute("INSERT OR REPLACE INTO players(user_id,team_id,signed_at,value_bonus) VALUES(?,?,datetime('now'),?)",
                    (uid, new["id"], bonus))
         team_id = new["id"]
@@ -948,13 +956,13 @@ def apply_offer(o):
         if kind == "sign":
             embed = tx_embed("You've Been Signed!", f"You have signed a contract with **{new['name']}**!",
                              f"> 🏟️ **New Club:** {new['name']}\n\nWelcome to the team! ⚽", new)
-            public = tx_embed("✍️ New Signing", f"**{new['name']}** signed {mention}.",
-                              f"> 🏟️ **Club:** {new['name']}\n> 📋 **From:** Free Agent", new)
+            public = tx_embed("✍️ OFFICIAL: New Signing", f"**{new['name']}** signed {mention}.",
+                              f"> 🏟️ **Club:** {new['name']}\n> 📋 **From:** Free Agent\n> 📈 **New market value:** {money(player_value(uid))}", new)
         elif kind == "transfer":
             embed = tx_embed("Transfer Complete", f"You have been transferred to **{new['name']}**!",
                              f"> 🔁 **From:** {old['name']}\n> 🏟️ **To:** {new['name']}{fee_line}", new, GREEN)
-            public = tx_embed("💰 Transfer Complete", f"**{new['name']}** bought {mention} from **{old['name']}**.",
-                              f"> 💰 **Fee:** {money(fee)}\n> 🏦 **{new['name']} budget left:** {money(left)}", new, GREEN)
+            public = tx_embed("🚨 HERE WE GO!", f"**{new['name']}** bought {mention} from **{old['name']}**.",
+                              f"> 💰 **Fee:** {money(fee)}\n> 🏦 **{new['name']} budget left:** {money(left)}\n> 📈 **New market value:** {money(player_value(uid))}", new, GREEN)
         else:
             embed = tx_embed("Loan Complete", f"You are now on loan at **{new['name']}**!",
                              f"> 🔁 **From:** {old['name']}\n> 🏟️ **Loan Club:** {new['name']}{fee_line}", new, GREEN)
@@ -1017,11 +1025,24 @@ async def handle_offer(i: discord.Interaction, offer_id: int, accept: bool):
     result, public = apply_offer(o)
     emb.color = discord.Color(GREEN); emb.set_footer(text="✅ You accepted this offer")
     await i.response.edit_message(embed=emb, view=None)
-    ch = await post_tx(guild, public, o["user_id"], content=f"<@{o['user_id']}>")
+    kind = o["kind"]
+    new, old = team_by_id(o["team_id"]), team_by_id(o["from_team_id"])
+    files = []
+    if kind in ("sign", "transfer", "loan"):
+        png = await make_here_we_go(kind, i.user, new, old, int(o["fee"] or 0))
+        if png:
+            public.set_image(url="attachment://herewego.jpg")
+            files.append(discord.File(io.BytesIO(png), filename="herewego.jpg"))
+    try:
+        role_note = await apply_team_roles(guild, o["user_id"], old, new)
+    except Exception as ex:
+        print(f"[roles] failed: {ex!r}")
+        role_note = ""
+    ch = await post_tx(guild, public, o["user_id"], content=f"<@{o['user_id']}>", files=files)
     if not ch or i.channel_id != ch.id:
         await i.followup.send(embed=result, view=profile_view(o["user_id"]))
     if staff_user:
-        try: await staff_user.send(f"✅ <@{o['user_id']}> **accepted** the {o['kind']} offer.")
+        try: await staff_user.send(f"✅ <@{o['user_id']}> **accepted** the {kind} offer." + (f"\n{role_note}" if role_note else ""))
         except discord.HTTPException: pass
 
 async def send_offer(i: discord.Interaction, player: discord.Member, kind: str, team, from_team, fee=0):
@@ -1416,7 +1437,7 @@ async def make_banner(h, a, center="VS"):
         return None
     try:
         hl, al = await asyncio.gather(team_logo_bytes(h), team_logo_bytes(a))
-        return await asyncio.to_thread(render_banner, h["name"], a["name"], center, hl, al)
+        return await run_render(render_banner, h["name"], a["name"], center, hl, al)
     except Exception as ex:
         print(f"[banner] failed: {ex!r}")
         return None
@@ -1900,11 +1921,60 @@ async def h2h(i: discord.Interaction, team_a: str, team_b: str):
     embeds, files = with_banner(e, png)
     await i.followup.send(embeds=embeds, **banner_kw(files))
 
-@bot.tree.command(description="List players without a team")
-async def freeagents(i: discord.Interaction):
-    rows = db.execute("SELECT user_id FROM players WHERE team_id IS NULL").fetchall()
-    desc = "\n".join(f"<@{r['user_id']}>" for r in rows[:60]) or "No free agents right now."
-    await i.response.send_message(embed=discord.Embed(title="Free Agents", color=PINK, description=desc))
+class Pager(discord.ui.View):
+    """◀ ▶ buttons over a list of embeds (only the person who ran the command can use them)."""
+    def __init__(self, embeds, user_id):
+        super().__init__(timeout=300)
+        self.embeds, self.page, self.user_id = embeds, 0, user_id
+        self._sync()
+
+    def _sync(self):
+        self.back.disabled = self.page == 0
+        self.fwd.disabled = self.page >= len(self.embeds) - 1
+
+    async def interaction_check(self, i: discord.Interaction):
+        if i.user.id != self.user_id:
+            await i.response.send_message("Only the person who ran the command can flip pages.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def back(self, i: discord.Interaction, button: discord.ui.Button):
+        self.page -= 1
+        self._sync()
+        await i.response.edit_message(embed=self.embeds[self.page], view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def fwd(self, i: discord.Interaction, button: discord.ui.Button):
+        self.page += 1
+        self._sync()
+        await i.response.edit_message(embed=self.embeds[self.page], view=self)
+
+@bot.tree.command(description="Everyone in the server who isn't on a team")
+@app_commands.describe(role="Only show people who have this role (optional)")
+async def freeagents(i: discord.Interaction, role: discord.Role = None):
+    await i.response.defer()
+    g = i.guild
+    if not g.chunked:
+        try:
+            await g.chunk()
+        except Exception:
+            pass
+    on_team = {r["user_id"] for r in db.execute("SELECT user_id FROM players WHERE team_id IS NOT NULL").fetchall()}
+    people = [m for m in g.members if not m.bot and m.id not in on_team and (role is None or role in m.roles)]
+    people.sort(key=lambda m: m.display_name.lower())
+    if not people:
+        return await i.followup.send("Nobody without a club right now.")
+    per, pages = 20, []
+    total_pages = math.ceil(len(people) / per)
+    for k in range(0, len(people), per):
+        desc = "\n".join(f"{m.mention} • {money(player_value(m.id))}" for m in people[k:k + per])
+        e = discord.Embed(title=f"Free Agents ({len(people)})", description=desc, color=PINK)
+        e.set_footer(text=f"Page {k // per + 1}/{total_pages} • value shown next to each name")
+        pages.append(e)
+    if len(pages) == 1:
+        return await i.followup.send(embed=pages[0])
+    await i.followup.send(embed=pages[0], view=Pager(pages, i.user.id))
 
 # ---------------------------------------------------------------- /table (logo image, private)
 _logo_cache = {}
@@ -1927,6 +1997,7 @@ async def fetch_logo(url):
         return data
     return None
 
+@functools.lru_cache(maxsize=64)
 def _font(size, bold=False):
     names = ("DejaVuSans-Bold.ttf", "arialbd.ttf") if bold else ("DejaVuSans.ttf", "arial.ttf")
     for n in names:
@@ -1939,11 +2010,11 @@ def _font(size, bold=False):
     except TypeError:
         return ImageFont.load_default()
 
-def _put(d, xy, text, font, fill, anchor="lm"):
+def _put(d, xy, text, font, fill, anchor="lm", **kw):
     try:
-        d.text(xy, text, font=font, fill=fill, anchor=anchor)
+        d.text(xy, text, font=font, fill=fill, anchor=anchor, **kw)
     except ValueError:
-        d.text(xy, text, font=font, fill=fill)
+        d.text(xy, text, font=font, fill=fill, **kw)
 
 def render_table(title, rows, logos, highlight_id=None, div_logo=None):
     W, ROW, HEAD = 940, 64, 104
@@ -2000,6 +2071,14 @@ def render_table(title, rows, logos, highlight_id=None, div_logo=None):
     img.save(buf, "PNG")
     return buf.getvalue()
 
+_table_cache = {}
+
+def _table_key(title, rows, logos, highlight_id, div_logo):
+    return hash((title, highlight_id, hash(div_logo) if div_logo else 0,
+                 tuple((r["pos"], r["team"]["id"], r["team"]["name"], r["p"], r["w"], r["d"], r["l"], r["gf"], r["ga"], r["pts"])
+                       for r in rows[:30]),
+                 tuple(hash(x) if x else 0 for x in logos)))
+
 @bot.tree.command(name="table", description="League table with every team's logo and position (only you see it)")
 @app_commands.autocomplete(tier=tier_ac)
 async def table_cmd(i: discord.Interaction, tier: str = None):
@@ -2013,10 +2092,16 @@ async def table_cmd(i: discord.Interaction, tier: str = None):
         rows = standings(tr)
         if not rows:
             continue
-        logos = await asyncio.gather(*(team_logo_bytes(r["team"]) for r in rows[:30]))
+        logos = await asyncio.gather(*(team_logo_bytes(r["team"]) for r in rows[:30]))   # stored copies: no downloads
         div = db.execute("SELECT logo FROM divisions WHERE name=?", (tr,)).fetchone()
-        png = await asyncio.to_thread(render_table, f"{league_short()} Table • {tr}", rows, logos,
-                                      mine["id"] if mine else None, div["logo"] if div else None)
+        title, hl, dlogo = f"{league_short()} Table • {tr}", (mine["id"] if mine else None), (div["logo"] if div else None)
+        key = _table_key(title, rows, logos, hl, dlogo)
+        png = _table_cache.get(key)
+        if png is None:                                  # only redraw when results/logos actually changed
+            png = await run_render(render_table, title, rows, logos, hl, dlogo)
+            if len(_table_cache) > 40:
+                _table_cache.pop(next(iter(_table_cache)))
+            _table_cache[key] = png
         files.append(discord.File(io.BytesIO(png), filename=f"table_{n + 1}.png"))
     if not files:
         return await i.followup.send("No teams yet.")
@@ -2098,6 +2183,11 @@ async def health(i: discord.Interaction):
         lines.append("⚠️ League logo not set or invalid (LEAGUE_LOGO_URL)")
     if Image is None:
         lines.append("❌ Pillow isn't installed, so /table can't draw. Add Pillow to requirements.txt.")
+    if not me.guild_permissions.manage_roles:
+        lines.append("❌ I don't have the **Manage Roles** permission, so team roles can't be given.")
+    else:
+        no_role = [t["name"] for t in teams_ if not find_team_role(g, t["name"])]
+        lines.append(f"⚠️ No matching role for: {', '.join(no_role[:10])}" if no_role else "✅ Every team has a matching role")
     stored = sum(1 for t in teams_ if t["logo_blob"])
     if stored:
         lines.append(f"✅ {stored} team logo(s) stored permanently")
@@ -2357,6 +2447,385 @@ def backfill_money():
     db.commit()
     set_setting("money_backfill_v1", "1")
 
+# ---------------------------------------------------------------- "HERE WE GO" transfer image
+_render_lock = threading.Lock()
+
+def _locked(fn, *args):
+    with _render_lock:
+        return fn(*args)
+
+async def run_render(fn, *args):
+    """Run a Pillow drawing job off the event loop (one at a time, so shared fonts are never used concurrently)."""
+    return await asyncio.to_thread(_locked, fn, *args)
+
+@functools.lru_cache(maxsize=16)
+def _serif_italic(size):
+    for n in ("DejaVuSerif-Italic.ttf", "georgiai.ttf", "timesi.ttf", "Times New Roman Italic.ttf"):
+        try:
+            return ImageFont.truetype(n, size)
+        except OSError:
+            continue
+    return _font(size, True)
+
+def clean_text(text):
+    """Keep only characters the image font can draw (fancy unicode names would show as boxes)."""
+    out = "".join(c for c in (text or "") if ord(c) < 0x250 or c in "–—•·")
+    return " ".join(out.split())
+
+@functools.lru_cache(maxsize=2)
+def _default_stadium(W, H):
+    """A night stadium: floodlights, crowd, ad boards and a striped pitch (drawn once, then cached)."""
+    rnd = random.Random(7)
+    img = Image.new("RGB", (W, H))
+    d = ImageDraw.Draw(img)
+    horizon, top = int(H * 0.80), int(H * 0.20)
+    for y in range(H):
+        t = y / H
+        d.line([(0, y), (W, y)], fill=(int(4 + 16 * t), int(8 + 34 * t), int(22 + 66 * t)))
+    for _ in range(30000):                                    # the crowd
+        x, y = rnd.randrange(W), rnd.randrange(top, horizon)
+        depth = (y - top) / (horizon - top)
+        b = 28 + int(64 * depth)
+        col = rnd.choice([(b, b + 20, b + 58), (b + 28, b + 40, b + 90), (b + 8, b, b + 28), (b + 60, b + 50, b + 42)])
+        r = 1 + int(2.2 * depth)
+        d.ellipse((x - r, y - r, x + r, y + r), fill=col)
+    for k in range(1, 7):                                     # stand tiers
+        y = int(top + (horizon - top) * k / 7)
+        d.line([(0, y), (W, y)], fill=(6, 12, 32), width=3)
+    d.rectangle((0, horizon - 44, W, horizon), fill=(8, 26, 100))   # advertising boards
+    for x in range(0, W, 128):
+        d.rectangle((x + 8, horizon - 36, x + 112, horizon - 8), fill=(22, 64, 178))
+        d.ellipse((x + 52, horizon - 30, x + 68, horizon - 14), fill=(190, 215, 255))
+    for y in range(horizon, H):                               # pitch
+        t = (y - horizon) / (H - horizon)
+        d.line([(0, y), (W, y)], fill=(int(16 + 22 * t), int(92 + 58 * t), int(26 + 22 * t)))
+    ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    od = ImageDraw.Draw(ov)
+    for x in range(0, W, 110):
+        if (x // 110) % 2:
+            od.rectangle((x, horizon, x + 110, H), fill=(255, 255, 255, 16))
+    od.line([(W // 2, horizon), (W // 2, H)], fill=(255, 255, 255, 180), width=5)
+    lights = [(70, 50), (200, 92), (340, 64), (940, 64), (1080, 92), (1210, 50), (640, 36)]
+    for cx, cy in lights:                                     # light beams
+        od.polygon([(cx - 8, cy), (cx + 8, cy), (cx + 170, horizon - 40), (cx - 170, horizon - 40)], fill=(170, 200, 255, 14))
+    img = Image.alpha_composite(img.convert("RGBA"), ov)
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    for cx, cy in lights:
+        gd.ellipse((cx - 46, cy - 46, cx + 46, cy + 46), fill=(255, 255, 255, 230))
+    img = Image.alpha_composite(img, glow.filter(ImageFilter.GaussianBlur(26)))
+    glow2 = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    gd2 = ImageDraw.Draw(glow2)
+    for cx, cy in lights:
+        gd2.ellipse((cx - 10, cy - 10, cx + 10, cy + 10), fill=(255, 255, 255, 255))
+    img = Image.alpha_composite(img, glow2.filter(ImageFilter.GaussianBlur(3)))
+    vign = Image.radial_gradient("L").resize((W, H)).point(lambda v: int(v * 0.85))
+    img = Image.composite(Image.new("RGB", (W, H), (0, 0, 0)), img.convert("RGB"), vign)
+    return img
+
+def stadium_background(W, H, custom=None):
+    if custom:
+        try:
+            im = Image.open(io.BytesIO(custom)).convert("RGB")
+            k = max(W / im.width, H / im.height)
+            im = im.resize((int(im.width * k) + 1, int(im.height * k) + 1))
+            l, t = (im.width - W) // 2, (im.height - H) // 2
+            return im.crop((l, t, l + W, t + H))
+        except Exception:
+            pass
+    return _default_stadium(W, H).copy()
+
+def dominant_color(png):
+    """Main colour of a crest (used for the tifo cloth). Falls back to blue for grey/black/white logos."""
+    try:
+        im = Image.open(io.BytesIO(png)).convert("RGBA")
+        im.thumbnail((48, 48))
+        data, buckets = im.tobytes(), {}
+        for k in range(0, len(data), 4):
+            r, g, b, a = data[k], data[k + 1], data[k + 2], data[k + 3]
+            if a < 200:
+                continue
+            acc = buckets.setdefault((r >> 5, g >> 5, b >> 5), [0, 0, 0, 0])
+            acc[0] += r; acc[1] += g; acc[2] += b; acc[3] += 1
+        best, score = None, 0
+        for r, g, b, n in buckets.values():
+            r, g, b = r // n, g // n, b // n
+            mx, mn = max(r, g, b), min(r, g, b)
+            sat = (mx - mn) / mx if mx else 0
+            if mx < 50 or (mx > 235 and sat < 0.2) or sat < 0.25:
+                continue
+            if n * (0.3 + sat) > score:
+                best, score = (r, g, b), n * (0.3 + sat)
+        if best:
+            f = min(1.0, 190 / max(best))
+            return tuple(int(c * f) for c in best)
+    except Exception:
+        pass
+    return (30, 70, 170)
+
+def render_here_we_go(avatar, from_logo, to_logo, title, sub, from_label, bg=None, to_label=None):
+    """Stadium + tifo (new club's crest on it, BEHIND the player's photo) + [old club] >>> [new club]."""
+    W, H, S = 1280, 720, 250
+    img = stadium_background(W, H, bg).convert("RGBA")
+    d = ImageDraw.Draw(img)
+    top_y, bot_y = 330, 540
+    poly = [(330, top_y), (950, top_y), (1030, bot_y), (250, bot_y)]
+    col = dominant_color(to_logo) if to_logo else (30, 70, 170)
+    shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(shadow).polygon([(x + 10, y + 14) for x, y in poly], fill=(0, 0, 0, 170))
+    img.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(14)))
+    mask = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(mask).polygon(poly, fill=255)
+    cloth = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    cloth.paste(col + (255,), mask=mask)
+    folds = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    fd = ImageDraw.Draw(folds)
+    for x in range(230, 1060, 6):                             # cloth folds
+        s = math.sin(x / 19.0) * math.sin(x / 71.0 + 1)
+        line = [(x, top_y - 6), (x + (x - 640) // 14, bot_y + 6)]
+        fd.line(line, fill=(255, 255, 255, int(70 * s)) if s >= 0 else (0, 0, 0, int(90 * -s)), width=6)
+    for k in range(50):                                       # sag shadow along the bottom
+        fd.line([(0, bot_y - 50 + k), (W, bot_y - 50 + k)], fill=(0, 0, 0, int(k * 1.7)))
+    folds.putalpha(ImageChops.multiply(folds.getchannel("A"), mask))
+    img.alpha_composite(cloth)
+    img.alpha_composite(folds)
+    if to_logo:                                               # crest on the tifo: drawn BEFORE the photo, so it stays behind it
+        lg = _logo_img(to_logo, 230)
+        if lg:
+            disc = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            ImageDraw.Draw(disc).ellipse((455 - 112, 432 - 112, 455 + 112, 432 + 112), fill=(255, 255, 255, 38))
+            img.alpha_composite(disc)
+            img.alpha_composite(lg, (int(455 - lg.width / 2), int(432 - lg.height / 2)))
+    ax0, ay0 = 640 - S // 2, 312
+    right_edge = 950 + 80 * ((432 - top_y) / (bot_y - top_y)) - 24
+    avail = right_edge - (ax0 + S + 16)
+    for sz in range(64, 24, -2):
+        f = _serif_italic(sz)
+        if d.textlength("Welcome!", font=f) <= avail:
+            break
+    _put(d, (ax0 + S + 16 + avail / 2, 432), "Welcome!", f, (255, 255, 255), "mm")
+    sh2 = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(sh2).rectangle((ax0 - 4, ay0 + 6, ax0 + S + 10, ay0 + S + 16), fill=(0, 0, 0, 190))
+    img.alpha_composite(sh2.filter(ImageFilter.GaussianBlur(9)))
+    d.rectangle((ax0 - 6, ay0 - 6, ax0 + S + 6, ay0 + S + 6), fill=(255, 255, 255))
+    try:
+        av = Image.open(io.BytesIO(avatar)).convert("RGBA").resize((S, S))
+        img.alpha_composite(av, (ax0, ay0))
+    except Exception:
+        d.rectangle((ax0, ay0, ax0 + S, ay0 + S), fill=(55, 58, 64))
+        _put(d, (640, ay0 + S // 2), "?", _font(110, True), (255, 255, 255), "mm")
+    cy, LS = 634, 134                                         # bottom row: [old club] >>> [new club]
+    def club(data, cx, label):
+        lg = _logo_img(data, LS) if data else None
+        if lg:
+            img.alpha_composite(lg, (int(cx - lg.width / 2), int(cy - lg.height / 2)))
+        else:
+            d.ellipse((cx - 62, cy - 62, cx + 62, cy + 62), fill=(58, 62, 70), outline=(255, 255, 255), width=3)
+            if label:
+                _put(d, (cx, cy), label[:1].upper(), _font(60, True), (255, 255, 255), "mm")
+            else:
+                _put(d, (cx, cy - 15), "FREE", _font(28, True), (255, 255, 255), "mm")
+                _put(d, (cx, cy + 15), "AGENT", _font(28, True), (255, 255, 255), "mm")
+    club(from_logo, 430, from_label)
+    club(to_logo, 850, to_label or "?")
+    for k in range(3):
+        x = 548 + k * 64
+        pts = [(x, cy - 36), (x + 34, cy - 36), (x + 66, cy), (x + 34, cy + 36), (x, cy + 36), (x + 32, cy)]
+        d.polygon(pts, fill=(8, 8, 8))
+        d.line(pts + [pts[0]], fill=(255, 255, 255), width=3)
+    _put(d, (640, 98), title, _font(112, True), (255, 255, 255), "mm", stroke_width=8, stroke_fill=(0, 0, 0))
+    if sub:
+        for sz in (42, 36, 30, 24):
+            f = _font(sz, True)
+            if d.textlength(sub, font=f) <= 1100:
+                break
+        _put(d, (640, 190), sub, f, (232, 238, 255), "mm", stroke_width=4, stroke_fill=(0, 0, 0))
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, "JPEG", quality=90)
+    return buf.getvalue()
+
+async def make_here_we_go(kind, user, new, old, fee=0):
+    """JPEG bytes of the transfer image, or None (no Pillow / any error: the text post still goes out)."""
+    if Image is None or not new:
+        return None
+    try:
+        avatar = None
+        try:
+            avatar = await user.display_avatar.replace(size=512, format="png").read()
+        except Exception:
+            pass
+        to_logo, from_logo = await asyncio.gather(team_logo_bytes(new), team_logo_bytes(old))
+        row = db.execute("SELECT data FROM assets WHERE name='transfer_bg'").fetchone()
+        title = {"transfer": "HERE WE GO!", "sign": "OFFICIAL", "loan": "LOAN DEAL"}.get(kind, "OFFICIAL")
+        name = clean_text(user.display_name) or clean_text(getattr(user, "name", ""))
+        sub = " • ".join(x for x in (name, money(fee) if fee else "") if x)
+        return await run_render(render_here_we_go, avatar, from_logo, to_logo, title, sub,
+                                old["name"] if old else None, row["data"] if row else None, new["name"])
+    except Exception as ex:
+        print(f"[herewego] image failed: {ex!r}")
+        return None
+
+def normalize_bg(raw):
+    try:
+        im = Image.open(io.BytesIO(raw)).convert("RGB")
+        k = max(1280 / im.width, 720 / im.height)
+        im = im.resize((int(im.width * k) + 1, int(im.height * k) + 1))
+        l, t = (im.width - 1280) // 2, (im.height - 720) // 2
+        buf = io.BytesIO()
+        im.crop((l, t, l + 1280, t + 720)).save(buf, "JPEG", quality=90)
+        return buf.getvalue()
+    except Exception:
+        return None
+
+@bot.tree.command(description="Set the background photo for the 'Here we go' transfer images (admins only)")
+@admin_only
+@app_commands.describe(image="Upload a stadium photo (leave empty to go back to the default stadium)")
+async def transfer_background(i: discord.Interaction, image: discord.Attachment = None):
+    await i.response.defer(ephemeral=True)
+    if not image:
+        db.execute("DELETE FROM assets WHERE name='transfer_bg'"); db.commit()
+        return await i.followup.send("✅ Back to the default stadium background.")
+    if Image is None:
+        return await i.followup.send("❌ Pillow isn't installed on the host.")
+    if (image.content_type and not image.content_type.startswith("image/")) or image.size > 12_000_000:
+        return await i.followup.send("That needs to be an image under 12 MB.")
+    data = await asyncio.to_thread(normalize_bg, await image.read())
+    if not data:
+        return await i.followup.send("❌ I couldn't read that image. Use a PNG or JPG.")
+    db.execute("INSERT OR REPLACE INTO assets(name, data) VALUES('transfer_bg', ?)", (data,)); db.commit()
+    await i.followup.send("✅ New background saved. Use `/herewego_preview` to see it.")
+
+@bot.tree.command(description="Preview the 'Here we go' image without making a transfer (staff)")
+@staff
+@app_commands.describe(to_team="The club they join", from_team="The club they leave (empty = free agent signing)",
+                       fee="Optional fee to show, e.g. 5m")
+@app_commands.autocomplete(to_team=team_ac, from_team=team_ac)
+async def herewego_preview(i: discord.Interaction, player: discord.Member, to_team: str,
+                           from_team: str = None, fee: str = "0"):
+    await i.response.defer(ephemeral=True)
+    new, old = get_team(to_team), (get_team(from_team) if from_team else None)
+    if not new or (from_team and not old):
+        return await i.followup.send("Team not found.")
+    png = await make_here_we_go("transfer" if old else "sign", player, new, old, parse_money(fee) or 0)
+    if not png:
+        return await i.followup.send("❌ Couldn't draw the image (is Pillow installed? check the console).")
+    await i.followup.send(file=discord.File(io.BytesIO(png), filename="herewego.jpg"))
+
+# ---------------------------------------------------------------- team roles (found by name, never created)
+LEADER_WORDS = {"manager", "owner", "captain", "coach", "staff", "admin", "mod", "moderator", "assistant", "founder", "head"}
+
+def _tokens(text):
+    return [t for t in re.split(r"[\W_]+", (text or "").lower()) if t]
+
+def role_score(role_name, team_name):
+    """How well an existing role matches a team: 'NAPXR | RMA' scores high for RMA, 'RMA Manager' scores 0."""
+    rt, tt = _tokens(role_name), _tokens(team_name)
+    if not tt or not rt:
+        return 0
+    n = len(tt)
+    pos = next((k for k in range(len(rt) - n + 1) if rt[k:k + n] == tt), None)
+    if pos is None:
+        return 0
+    if any(w in LEADER_WORDS and w not in tt for w in rt[:pos] + rt[pos + n:]):
+        return 0
+    if rt == tt:
+        return 5
+    return 4 if pos + n == len(rt) else 3
+
+def find_team_role(guild, team_name):
+    """The existing role whose name contains the team's name (best match, shortest name wins ties)."""
+    best = None
+    for r in guild.roles:
+        if r.is_default() or r.managed:
+            continue
+        sc = role_score(r.name, team_name)
+        if sc and (best is None or (sc, -len(r.name)) > best[0]):
+            best = ((sc, -len(r.name)), r)
+    return best[1] if best else None
+
+async def apply_team_roles(guild, uid, old, new):
+    """Swap the player's old team role for the new team's role. Returns a short note (for the staff DM)."""
+    if not guild:
+        return ""
+    if not guild.me.guild_permissions.manage_roles:
+        return "⚠️ Roles not changed: I need the **Manage Roles** permission."
+    try:
+        member = guild.get_member(uid) or await guild.fetch_member(uid)
+    except discord.HTTPException:
+        return "⚠️ Roles not changed: that player isn't in the server."
+    notes, remove, add = [], None, None
+    if old:
+        remove = find_team_role(guild, old["name"])
+    if new:
+        add = find_team_role(guild, new["name"])
+        if not add:
+            notes.append(f"⚠️ No role containing **{new['name']}** exists, so no team role was given.")
+    try:
+        if remove and remove != add and remove in member.roles:
+            if remove.is_assignable():
+                await member.remove_roles(remove, reason="PitchX: left the team")
+                notes.append(f"➖ removed {remove.mention}")
+            else:
+                notes.append(f"⚠️ I can't remove {remove.mention}: move my bot role above it.")
+        if add and add not in member.roles:
+            if add.is_assignable():
+                await member.add_roles(add, reason="PitchX: joined the team")
+                notes.append(f"➕ gave {add.mention}")
+            else:
+                notes.append(f"⚠️ I can't give {add.mention}: move my bot role above it.")
+    except discord.HTTPException as ex:
+        notes.append(f"⚠️ Role change failed ({type(ex).__name__}).")
+    return " • ".join(notes)
+
+@bot.tree.command(description="Give every rostered player their team's role (admins only)")
+@admin_only
+async def sync_roles(i: discord.Interaction):
+    await i.response.defer(ephemeral=True)
+    g = i.guild
+    if not g.me.guild_permissions.manage_roles:
+        return await i.followup.send("❌ I need the **Manage Roles** permission.")
+    given, already, no_role, blocked, gone = 0, 0, set(), set(), 0
+    for p in db.execute("SELECT user_id, team_id FROM players WHERE team_id IS NOT NULL").fetchall():
+        t = team_by_id(p["team_id"])
+        member = g.get_member(p["user_id"])
+        if not t or not member:
+            gone += 1
+            continue
+        role = find_team_role(g, t["name"])
+        if not role:
+            no_role.add(t["name"])
+        elif role in member.roles:
+            already += 1
+        elif not role.is_assignable():
+            blocked.add(role.name)
+        else:
+            try:
+                await member.add_roles(role, reason="PitchX: sync roles")
+                given += 1
+            except discord.HTTPException:
+                blocked.add(role.name)
+            await asyncio.sleep(0.4)
+    lines = [f"✅ Gave **{given}** role(s). **{already}** player(s) already had theirs."]
+    if no_role:
+        lines.append(f"⚠️ No matching role for: {', '.join(sorted(no_role))}")
+    if blocked:
+        lines.append(f"⚠️ I can't assign (move my bot role higher): {', '.join(sorted(blocked))}")
+    if gone:
+        lines.append(f"ℹ️ {gone} rostered player(s) aren't in the server.")
+    await i.followup.send("\n".join(lines))
+
+def backfill_sign_bonus():
+    """One-time: players already signed from free agency before this update get the signing value bonus."""
+    if get_setting("sign_backfill_v1"):
+        return
+    for r in db.execute("""SELECT o.user_id, o.team_id FROM offers o WHERE o.status='accepted' AND o.kind='sign'
+                           AND o.id=(SELECT MAX(id) FROM offers WHERE user_id=o.user_id AND status='accepted')""").fetchall():
+        p = db.execute("SELECT team_id, value_bonus FROM players WHERE user_id=?", (r["user_id"],)).fetchone()
+        if p and p["team_id"] == r["team_id"] and not p["value_bonus"]:
+            db.execute("UPDATE players SET value_bonus=? WHERE user_id=?", (SIGN_VALUE_BONUS, r["user_id"]))
+    db.commit()
+    set_setting("sign_backfill_v1", "1")
+
 @bot.tree.command(description="Set the role that can use staff commands (admins always can)")
 @staff
 async def staffrole(i: discord.Interaction, role: discord.Role):
@@ -2402,6 +2871,7 @@ async def setup_hook():
     backup_loop.start()
     matchday_loop.start()
     backfill_money()
+    backfill_sign_bonus()
     asyncio.create_task(migrate_logos())
     if GUILD_ID:
         # server-only commands (appear instantly); wipe the global copies that cause duplicates

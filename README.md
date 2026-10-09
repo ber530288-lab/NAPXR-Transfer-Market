@@ -111,3 +111,15 @@ Fix: set `DB_PATH` to one fixed location in your variables, or run `/restore` wi
 - **Transfers:** the price paid becomes the player's market value (bought for $100M = worth $100M; later goals/assists add on top).
   The public post says who bought whom and for how much, and `/budget` shows spent, received, and who each team bought/sold.
 - **Name:** embeds say NAPXR. Change it any time with `/league_name` (admins).
+
+## "Here we go" images, team roles, free agents
+- Every accepted transfer posts a stadium image: the player's Discord photo in the middle, the new club's crest on the tifo behind it,
+  and `[old club] >>> [new club]` along the bottom. Transfers say **HERE WE GO!**, free-agent signings say **OFFICIAL**, loans say **LOAN DEAL**.
+  Admins can use their own stadium photo with `/transfer_background` (no upload = default). `/herewego_preview` shows one without making a transfer.
+- **Team roles:** on sign / transfer / loan / release the bot finds an EXISTING role whose name contains the team name
+  (e.g. `NAPXR | RMA` for RMA; roles with words like Manager/Owner/Captain are ignored), gives it, and removes the old team's role.
+  It never creates roles. The bot needs **Manage Roles** and its own role must sit ABOVE the team roles. `/sync_roles` (admins) gives
+  everyone on a roster their role in one go; `/health` lists teams with no matching role.
+- **Signing raises value:** a free agent who signs for a team gains `SIGN_VALUE_BONUS` ($500k by default). A transfer sets value to the price paid.
+- **/freeagents** lists EVERY member without a club (not just released players), 20 per page with ◀ ▶ buttons, with an optional `role` filter.
+- **/table** is faster: logos are stored copies (no downloads), fonts are cached, and an unchanged table is reused instantly.
