@@ -53,8 +53,18 @@ PINK, ORANGE, GREEN, YELLOW, RED = 0xE91E63, 0xF57C00, 0x2ECC71, 0xF1C40F, 0xE74
 FORM = {"W": "🟢", "D": "🟡", "L": "🔴"}
 
 # ---------------------------------------------------------------- database
-DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "pitchx.db"))
-BACKUP_DIR = os.getenv("BACKUP_DIR", os.path.join(os.path.dirname(DB_PATH), "backups"))
+# Where the data lives. Priority: DB_PATH variable > Railway Volume (auto-detected) > next to bot.py.
+# (Empty variables count as "not set". An empty path would make SQLite use a throwaway temporary database.)
+_vol = (os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or "").strip()
+DB_PATH = (os.getenv("DB_PATH") or "").strip() or (os.path.join(_vol, "pitchx.db") if _vol else
+                                                  os.path.join(os.path.dirname(os.path.abspath(__file__)), "pitchx.db"))
+BACKUP_DIR = (os.getenv("BACKUP_DIR") or "").strip() or os.path.join(os.path.dirname(DB_PATH), "backups")
+ON_RAILWAY = bool(os.getenv("RAILWAY_PROJECT_ID") or os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_SERVICE_ID"))
+# Railway's normal disk is erased on every deploy. Without a Volume (or a DB_PATH pointing at one) data cannot survive an update.
+EPHEMERAL = ON_RAILWAY and not _vol and not (os.getenv("DB_PATH") or "").strip()
+EPHEMERAL_WARNING = ("⚠️ **Your data will be erased on every update.** The bot is running on Railway without a **Volume**, and Railway's disk "
+                     "is wiped on each deploy. In Railway: open this service, add a **Volume** with mount path `/data`, then redeploy. "
+                     "The bot picks it up automatically. Run `/health` afterwards to confirm.")
 BACKUP_KEEP = int(os.getenv("BACKUP_KEEP", "30"))
 BACKUP_CHANNEL_NAME = "pitchx-backups"
 AUTO_BACKUP_CHANNEL = os.getenv("AUTO_BACKUP_CHANNEL", "1") == "1"   # create a private #pitchx-backups channel if missing
@@ -147,6 +157,9 @@ print(f"[db] {DB_PATH}: {db.execute('SELECT COUNT(*) FROM teams').fetchone()[0]}
       f"{db.execute('SELECT COUNT(*) FROM players').fetchone()[0]} players, "
       f"{db.execute('SELECT COUNT(*) FROM fixtures').fetchone()[0]} fixtures loaded")
 STARTED_EMPTY = db.execute("SELECT COUNT(*) FROM teams").fetchone()[0] == 0
+print(f"[db] data file: {DB_PATH}" + ("  (Railway Volume)" if _vol else ""))
+if EPHEMERAL:
+    print("[db] WARNING: running on Railway with NO Volume. Everything is erased on every deploy. Add a Volume mounted at /data.")
 if STARTED_EMPTY:
     print(f"[db] WARNING: empty database at {DB_PATH}. If you had teams before, this file was replaced or you started the bot from a new folder.")
 
@@ -2272,6 +2285,10 @@ async def health(i: discord.Interaction):
     nb = len(glob.glob(os.path.join(BACKUP_DIR, "pitchx-*.db")))
     last = float(get_setting("last_backup_post") or 0)
     bch = chan(g, "backup_channel")
+    if EPHEMERAL:
+        lines.append("❌ **No Railway Volume: your data is erased on every deploy.** Add a Volume mounted at `/data` and redeploy.")
+    elif _vol:
+        lines.append(f"✅ Data is on a Railway Volume (`{_vol}`), so updates won't erase it.")
     lines.append(f"💾 Data file: `{DB_PATH}` ({os.path.getsize(DB_PATH) // 1024} KB, changed {tsf(os.path.getmtime(DB_PATH), 'R')}) • {nb} local backups")
     lines.append((f"✅ Off-host backup in {bch.mention}, last posted {tsf(last, 'R')}" if bch and last else
                   f"⚠️ No off-host backup yet. I'll create **#{BACKUP_CHANNEL_NAME}** (needs Manage Channels), or make that channel yourself.")
@@ -2466,6 +2483,9 @@ async def startup_data_check():
     """Runs once after login: if the bot woke up with NO data, bring it back from Discord (or say loudly that it can't)."""
     await asyncio.sleep(3)
     try:
+        if EPHEMERAL:
+            for guild in bot.guilds:
+                await notify_owner(guild, EPHEMERAL_WARNING)
         if db.execute("SELECT COUNT(*) FROM teams").fetchone()[0] > 0:
             return
         if os.getenv("AUTO_RESTORE", "1") == "1":

@@ -1,0 +1,8 @@
+# Never commit your live data or secrets: a committed old pitchx.db would be restored on every deploy.
+*.db
+*.db-wal
+*.db-shm
+backups/
+.env
+__pycache__/
+*.pyc

@@ -155,3 +155,13 @@ To check right now: run `/health` and confirm it shows an off-host backup.
 ## Images
 Text drawn onto images (Here we go, banners, tables, trophy shelf) now uses only plain characters ("-", "...", "x"), so you never see a square box,
 whatever fonts your host has. Anything the font can't draw is removed automatically.
+
+## Railway (GitHub -> Railway auto-deploy): keep your data between updates
+Railway builds a brand-new container from GitHub on every deploy and **erases everything the bot saved on disk**, including `pitchx.db`.
+That is why teams and signings vanished after each update. The fix is a Railway **Volume** (a disk that survives deploys):
+1. In Railway open your project, then the bot service. Add a **Volume** (right-click the service canvas or use the command menu, "Volume"), mount path `/data`.
+2. Redeploy. The bot detects the volume by itself (`RAILWAY_VOLUME_MOUNT_PATH`); you don't need to set any variable. Don't set `DB_PATH` to an empty value.
+3. Run `/health`. It must say "Data is on a Railway Volume". If it says "No Railway Volume", the volume isn't attached to this service yet.
+4. Do this BEFORE re-entering your teams. After this, updating from GitHub no longer touches your data.
+Also: never commit `pitchx.db` or `.env` to GitHub (the included `.gitignore` prevents it). A committed old `pitchx.db` would be restored on every deploy and look like a reset.
+The `#pitchx-backups` Discord channel is a second safety net, so even a deleted volume can be restored automatically.
