@@ -31,12 +31,15 @@ LEAGUE_NAME = os.getenv("LEAGUE_NAME", "VCL X NAPXR.GG | PitchX")
 _env_short = os.getenv("LEAGUE_SHORT", "NAPXR").strip() or "NAPXR"
 DEFAULT_LEAGUE_SHORT = "NAPXR" if _env_short.lower() == "pitchx" else _env_short   # old example default was PitchX
 def _url(v):
-    return v if v and v.startswith(("http://", "https://")) else None
+    v = (v or "").strip()
+    return v if v.startswith(("http://", "https://")) and " " not in v else None
 
 LEAGUE_LOGO = _url(os.getenv("LEAGUE_LOGO_URL"))
-PROFILE_URL = os.getenv("PROFILE_URL", "https://discord.com/users/{user_id}")
+PROFILE_URL = _url(os.getenv("PROFILE_URL")) or "https://discord.com/users/{user_id}"
 DASHBOARD_URL = _url(os.getenv("DASHBOARD_URL"))
 REMINDER_DAYS = float(os.getenv("REMINDER_DAYS", "14"))
+# Warnings about the bot itself (data loss, broken permissions...) are DMed ONLY to these Discord user IDs. Override with the ADMIN_USER_IDS variable.
+ADMIN_USER_IDS = [int(x) for x in re.split(r"[,\s]+", os.getenv("ADMIN_USER_IDS") or "1444032534525644830") if x.isdigit()]
 MATCHDAY_LEAD_HOURS = float(os.getenv("MATCHDAY_LEAD_HOURS", "24"))
 OFFER_HOURS = 48
 START_BUDGET = int(os.getenv("START_BUDGET", "100000000"))
@@ -216,7 +219,7 @@ async def tier_ac(_, current: str):
 def profile_view(user_id):
     v = discord.ui.View()
     v.add_item(discord.ui.Button(label="View Your Profile", emoji="↗️",
-                                 url=PROFILE_URL.format(user_id=user_id)))
+                                 url=PROFILE_URL.replace("{user_id}", str(user_id))))
     return v
 
 def dashboard_view():
@@ -996,9 +999,21 @@ def apply_offer(o):
 
 _last_image_error = ""
 
+def err_text(ex):
+    """Exact reason Discord gave (status, code, message) so a failure can actually be diagnosed."""
+    status, code = getattr(ex, "status", None), getattr(ex, "code", None)
+    if status is not None:
+        return f"HTTP {status}, code {code}: {str(getattr(ex, 'text', '') or ex)[:260]}"
+    return f"{type(ex).__name__}: {str(ex)[:200]}"
+
+def perm_error(ex):
+    return (isinstance(ex, PermissionError) or getattr(ex, "status", None) == 403 or "Forbidden" in type(ex).__name__
+            or "Missing Permissions" in str(ex))
+
 async def announce_deal(guild, o, public, png):
-    """Post a completed deal. Returns (channel or None, note for staff).
-    Tries with the image first; if Discord refuses (usually a missing Attach Files permission) it posts the text version."""
+    """Post a completed deal and ALWAYS get something out. Returns (channel or None, note for the admin).
+    Tries: (1) with the image, (2) without the image, (3) a bare embed (no logos/buttons), (4) plain text.
+    The note carries Discord's exact error so a problem can be fixed instead of guessed at."""
     ch = chan(guild, "tx_channel")
     where_note = ""
     if not ch and guild and o["channel_id"]:
@@ -1007,23 +1022,40 @@ async def announce_deal(guild, o, public, png):
     if not ch:
         return None, "⚠️ Nothing was posted publicly: no transactions channel is set. Use /setchannel Transactions."
     mention, view = f"<@{o['user_id']}>", profile_view(o["user_id"])
-    img_note = ""
-    if png:
+    first_error = None
+
+    async def attempt(label, **kw):
+        nonlocal first_error
         try:
-            await asyncio.wait_for(ch.send(content=mention, embed=public, view=view,
-                                           files=[discord.File(io.BytesIO(png), filename="herewego.jpg")]), timeout=25)
-            return ch, where_note
+            await asyncio.wait_for(ch.send(content=mention, **kw), timeout=25)
+            return True
         except Exception as ex:
-            print(f"[deal] posting with the image failed: {ex!r}")
-            public.set_image(url=None)
-            img_note = f"⚠️ I posted without the image in {ch.mention} ({type(ex).__name__}). Give me the **Attach Files** permission there."
+            print(f"[deal] post stage '{label}' failed: {err_text(ex)}")
+            if first_error is None:
+                first_error = ex
+            return False
+
+    def note_for(what):
+        hint = " Give me the **Attach Files**, **Embed Links** and **Send Messages** permissions there." if perm_error(first_error) else ""
+        return f"⚠️ I posted {what} in {ch.mention}. Discord refused the full post: {err_text(first_error)}.{hint}"
+
+    if png:
+        if await attempt("image", embed=public, view=view, files=[discord.File(io.BytesIO(png), filename="herewego.jpg")]):
+            return ch, where_note
+        public.set_image(url=None)
+    if await attempt("no image", embed=public, view=view):
+        return ch, (note_for("without the image") if first_error else where_note)
+    bare = discord.Embed(title=public.title, description=public.description, color=public.color)
+    if await attempt("bare embed", embed=bare):
+        return ch, note_for("a simplified version (no logos or buttons)")
+    text = f"**{public.title}**\n{public.description}"[:1800]
     try:
-        await asyncio.wait_for(ch.send(content=mention, embed=public, view=view), timeout=20)
-        return ch, (img_note or where_note)
+        await asyncio.wait_for(ch.send(content=f"{mention} {text}"[:1900]), timeout=20)
+        return ch, note_for("a plain-text version")
     except Exception as ex:
-        print(f"[deal] posting failed: {ex!r}")
-        return None, (f"⚠️ I can't post in {ch.mention} ({type(ex).__name__}). Give me View Channel, Send Messages, "
-                      "Embed Links and Attach Files there.")
+        print(f"[deal] plain text failed: {err_text(ex)}")
+        extra = " Give me View Channel, Send Messages, Embed Links and Attach Files there." if perm_error(ex) or perm_error(first_error) else ""
+        return None, f"⚠️ I can't post in {ch.mention}. Discord said: {err_text(first_error or ex)}.{extra}"
 
 async def handle_offer(i: discord.Interaction, offer_id: int, accept: bool):
     o = db.execute("SELECT * FROM offers WHERE id=?", (offer_id,)).fetchone()
@@ -1102,9 +1134,13 @@ async def handle_offer(i: discord.Interaction, offer_id: int, accept: bool):
             await i.followup.send(embed=result, view=profile_view(o["user_id"]))
     except Exception as ex:
         print(f"[deal] player confirmation failed: {ex!r}")
+    line = f"✅ <@{o['user_id']}> **accepted** the {kind} offer."
+    offerer_is_admin = bool(staff_user) and staff_user.id in ADMIN_USER_IDS
     if staff_user:
-        try: await staff_user.send(f"✅ <@{o['user_id']}> **accepted** the {kind} offer." + ("\n" + "\n".join(notes) if notes else ""))
+        try: await staff_user.send(line + ("\n" + "\n".join(notes) if notes and offerer_is_admin else ""))
         except discord.HTTPException: pass
+    if notes:
+        await dm_admins(f"{line} (offer made by <@{o['staff_id']}>)\n" + "\n".join(notes), skip={staff_user.id} if offerer_is_admin else ())
 
 async def send_offer(i: discord.Interaction, player: discord.Member, kind: str, team, from_team, fee=0):
     db.execute("UPDATE offers SET status='cancelled' WHERE user_id=? AND status='pending'", (player.id,))
@@ -2379,12 +2415,31 @@ async def reminder_now(i: discord.Interaction, kind: app_commands.Choice[str]):
     sent, failed = await send_reminders(kind.value)
     await i.followup.send(f"📨 Reminder sent: {sent} DMs, {failed} failed.")
 
+async def dm_admins(text, skip=()):
+    """DM the admin(s) from ADMIN_USER_IDS and nobody else. Returns how many were reached."""
+    reached = 0
+    for uid in ADMIN_USER_IDS:
+        if uid in skip:
+            continue
+        try:
+            user = bot.get_user(uid) or await bot.fetch_user(uid)
+            await user.send(text[:1900])
+            reached += 1
+        except Exception as ex:
+            print(f"[admin] couldn't DM {uid}: {ex!r}")
+    return reached
+
 async def notify_owner(guild, text):
-    try:
-        owner = guild.owner or await guild.fetch_member(guild.owner_id)
-        await owner.send(text)
-    except Exception:
-        pass
+    """Warnings about the bot: DM only the admin ID(s). Falls back to the log channel (or, if no admin ID is configured, the server owner)."""
+    if await dm_admins(text):
+        return
+    if not ADMIN_USER_IDS:
+        try:
+            owner = guild.owner or await guild.fetch_member(guild.owner_id)
+            await owner.send(text)
+            return
+        except Exception:
+            pass
     ch = chan(guild, "log_channel")
     if ch:
         try:
@@ -2980,15 +3035,15 @@ async def apply_team_roles(guild, uid, old, new):
         if remove and remove != add and remove in member.roles:
             if remove.is_assignable():
                 await member.remove_roles(remove, reason="PitchX: left the team")
-                notes.append(f"➖ removed {remove.mention}")
+                notes.append(f"➖ removed **{remove.name}**")
             else:
-                notes.append(f"⚠️ I can't remove {remove.mention}: move my bot role above it.")
+                notes.append(f"⚠️ I can't remove **{remove.name}**: move my bot role above it.")
         if add and add not in member.roles:
             if add.is_assignable():
                 await member.add_roles(add, reason="PitchX: joined the team")
-                notes.append(f"➕ gave {add.mention}")
+                notes.append(f"➕ gave **{add.name}**")
             else:
-                notes.append(f"⚠️ I can't give {add.mention}: move my bot role above it.")
+                notes.append(f"⚠️ I can't give **{add.name}**: move my bot role above it.")
     except discord.HTTPException as ex:
         notes.append(f"⚠️ Role change failed ({type(ex).__name__}).")
     return " • ".join(notes)

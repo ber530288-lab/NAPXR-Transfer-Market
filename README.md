@@ -165,3 +165,11 @@ That is why teams and signings vanished after each update. The fix is a Railway 
 4. Do this BEFORE re-entering your teams. After this, updating from GitHub no longer touches your data.
 Also: never commit `pitchx.db` or `.env` to GitHub (the included `.gitignore` prevents it). A committed old `pitchx.db` would be restored on every deploy and look like a reset.
 The `#pitchx-backups` Discord channel is a second safety net, so even a deleted volume can be restored automatically.
+
+## Who receives the bot's private messages
+- **Warnings about the bot itself** (empty database, no Railway Volume, a failed announcement, missing permissions) are DMed ONLY to the IDs in
+  `ADMIN_USER_IDS` (default: the league owner). Nobody else receives them. Players never get these.
+- The person who made an offer gets just "X accepted the offer"; the technical details of any problem go to the admin only.
+- Transfer announcements now retry in four steps (with image, without image, simplified embed, plain text) so something is ALWAYS posted,
+  and the admin DM contains Discord's exact error (e.g. `HTTP 400, code 50035`) if the full version was refused.
+- Links in buttons and logos are trimmed and validated, so a stray space in a variable can't make Discord reject posts.
