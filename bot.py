@@ -36,7 +36,7 @@ def _url(v):
 
 LEAGUE_LOGO = _url(os.getenv("LEAGUE_LOGO_URL"))
 PROFILE_URL = _url(os.getenv("PROFILE_URL")) or "https://discord.com/users/{user_id}"
-DASHBOARD_URL = _url(os.getenv("DASHBOARD_URL"))
+DASHBOARD_URL = _url(os.getenv("DASHBOARD_URL")) or "https://vclgg-napxrgg-manager-dash-68.base44.app/"
 REMINDER_DAYS = float(os.getenv("REMINDER_DAYS", "14"))
 # Warnings about the bot itself (data loss, broken permissions...) are DMed ONLY to these Discord user IDs. Override with the ADMIN_USER_IDS variable.
 ADMIN_USER_IDS = [int(x) for x in re.split(r"[,\s]+", os.getenv("ADMIN_USER_IDS") or "1444032534525644830") if x.isdigit()]
@@ -3358,6 +3358,15 @@ class Dashboard(discord.ui.View):
             b = discord.ui.Button(label=label, emoji=emoji, style=style, row=2)
             b.callback = cb
             self.add_item(b)
+
+        # Direct link to the web-based manager dashboard.
+        self.add_item(discord.ui.Button(
+            label="Open Web Dashboard",
+            emoji="🌐",
+            style=discord.ButtonStyle.link,
+            url=DASHBOARD_URL,
+            row=3,
+        ))
 
     async def interaction_check(self, i: discord.Interaction):
         if i.user.id != self.user_id:

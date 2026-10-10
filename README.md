@@ -125,7 +125,7 @@ Fix: set `DB_PATH` to one fixed location in your variables, or run `/restore` wi
 - **/table** is faster: logos are stored copies (no downloads), fonts are cached, and an unchanged table is reused instantly.
 
 ## Manager dashboard (`/dashboard`)
-Managers (and staff) run `/dashboard` and get a private control panel for their team (only they see it). Pick a section from the menu:
+Managers (and staff) run `/dashboard` and get a private control panel for their team (only they see it). The **🌐 Open Web Dashboard** button takes them to https://vclgg-napxrgg-manager-dash-68.base44.app/. Set `DASHBOARD_URL` in the host environment if you ever change the site. Pick a section from the menu:
 - **Overview**: league position, record, form, budget, squad value, next match, last result, top performers, pending offers.
 - **Squad**: every player with value, goals, assists and clean sheets.
 - **Fixtures**: next 5 games and last 5 results.
