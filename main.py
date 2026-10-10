@@ -1,1 +1,1 @@
-import bot  # starts the bot (some hosts run main.py by default)
+import bot  # starts the Discord bot and dashboard API

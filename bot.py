@@ -3529,6 +3529,158 @@ async def setup_hook():
     else:
         await bot.tree.sync()
 
+
+# ---------------------------------------------------------------- dashboard HTTP API
+# Read-only endpoints for the Base44 manager dashboard. Set DASHBOARD_API_KEY in Railway.
+# All data-changing actions must continue to use the bot's existing validated command logic.
+from aiohttp import web
+import hmac
+
+DASHBOARD_API_KEY = (os.getenv("DASHBOARD_API_KEY") or "").strip()
+_api_runner = None
+
+def _api_authorized(request):
+    supplied = request.headers.get("X-API-Key", "")
+    return bool(DASHBOARD_API_KEY and supplied and
+                hmac.compare_digest(supplied, DASHBOARD_API_KEY))
+
+@web.middleware
+async def _dashboard_api_auth(request, handler):
+    # A public health endpoint lets Railway verify that the HTTP process is alive.
+    if request.path == "/api/health":
+        return await handler(request)
+    if not DASHBOARD_API_KEY:
+        return web.json_response(
+            {"error": "API key is not configured. Set DASHBOARD_API_KEY in Railway Variables."},
+            status=503
+        )
+    if not _api_authorized(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    return await handler(request)
+
+async def _api_health(request):
+    return web.json_response({
+        "ok": True,
+        "service": "NAPXR.GG Transfer Market API",
+        "api_key_configured": bool(DASHBOARD_API_KEY)
+    })
+
+async def _api_teams(request):
+    rows = db.execute("""
+        SELECT t.id, t.name, t.logo, t.tier, t.budget,
+               CASE WHEN t.logo_blob IS NULL THEN 0 ELSE 1 END AS has_logo_blob
+        FROM teams t ORDER BY t.name COLLATE NOCASE
+    """).fetchall()
+    teams = []
+    for row in rows:
+        teams.append({
+            "id": row["id"],
+            "name": row["name"],
+            "logo_url": row["logo"],
+            "league": row["tier"],
+            "budget": int(budget_of(row)),
+            "has_uploaded_logo": bool(row["has_logo_blob"])
+        })
+    return web.json_response({"teams": teams, "count": len(teams)})
+
+async def _api_team_players(request):
+    try:
+        team_id = int(request.match_info["team_id"])
+    except (TypeError, ValueError):
+        return web.json_response({"error": "Invalid team ID"}, status=400)
+    team = db.execute("SELECT id, name FROM teams WHERE id=?", (team_id,)).fetchone()
+    if not team:
+        return web.json_response({"error": "Team not found"}, status=404)
+    rows = db.execute("""
+        SELECT p.user_id, p.team_id, p.signed_at, p.value_bonus,
+               COALESCE(SUM(ms.goals), 0) AS goals,
+               COALESCE(SUM(ms.assists), 0) AS assists,
+               COALESCE(SUM(ms.clean_sheets), 0) AS clean_sheets
+        FROM players p
+        LEFT JOIN match_stats ms ON ms.user_id = p.user_id
+        WHERE p.team_id = ?
+        GROUP BY p.user_id, p.team_id, p.signed_at, p.value_bonus
+        ORDER BY p.user_id
+    """, (team_id,)).fetchall()
+    players = []
+    for row in rows:
+        user = bot.get_user(int(row["user_id"]))
+        players.append({
+            "discord_user_id": int(row["user_id"]),
+            "name": user.display_name if user else None,
+            "team_id": int(row["team_id"]) if row["team_id"] is not None else None,
+            "signed_at": row["signed_at"],
+            "market_value": int(player_value(int(row["user_id"]))),
+            "goals": int(row["goals"] or 0),
+            "assists": int(row["assists"] or 0),
+            "clean_sheets": int(row["clean_sheets"] or 0)
+        })
+    return web.json_response({
+        "team": {"id": team["id"], "name": team["name"]},
+        "players": players,
+        "count": len(players)
+    })
+
+async def _api_transfers(request):
+    limit = min(max(int(request.query.get("limit", "50")) if request.query.get("limit", "50").isdigit() else 50, 1), 100)
+    rows = db.execute("""
+        SELECT tr.id, tr.ts, tr.kind, tr.user_id, tr.from_team_id, tr.to_team_id, tr.fee,
+               src.name AS from_team_name, dst.name AS to_team_name
+        FROM transfers tr
+        LEFT JOIN teams src ON src.id = tr.from_team_id
+        LEFT JOIN teams dst ON dst.id = tr.to_team_id
+        ORDER BY tr.id DESC LIMIT ?
+    """, (limit,)).fetchall()
+    return web.json_response({"transfers": [
+        {
+            "id": int(r["id"]), "date": r["ts"], "type": r["kind"],
+            "discord_user_id": int(r["user_id"]) if r["user_id"] is not None else None,
+            "from_team_id": r["from_team_id"], "from_team": r["from_team_name"],
+            "to_team_id": r["to_team_id"], "to_team": r["to_team_name"],
+            "fee": int(r["fee"] or 0)
+        } for r in rows
+    ]})
+
+async def _api_offers(request):
+    limit = min(max(int(request.query.get("limit", "50")) if request.query.get("limit", "50").isdigit() else 50, 1), 100)
+    rows = db.execute("""
+        SELECT o.id, o.kind, o.user_id, o.team_id, o.from_team_id, o.fee,
+               o.created_at, o.status, src.name AS from_team_name, dst.name AS team_name
+        FROM offers o
+        LEFT JOIN teams src ON src.id = o.from_team_id
+        LEFT JOIN teams dst ON dst.id = o.team_id
+        ORDER BY o.id DESC LIMIT ?
+    """, (limit,)).fetchall()
+    return web.json_response({"offers": [
+        {
+            "id": int(r["id"]), "type": r["kind"],
+            "discord_user_id": int(r["user_id"]) if r["user_id"] is not None else None,
+            "team_id": r["team_id"], "team": r["team_name"],
+            "from_team_id": r["from_team_id"], "from_team": r["from_team_name"],
+            "fee": int(r["fee"] or 0), "created_at": r["created_at"],
+            "status": r["status"]
+        } for r in rows
+    ]})
+
+async def start_dashboard_api():
+    global _api_runner
+    if _api_runner is not None:
+        return
+    app = web.Application(middlewares=[_dashboard_api_auth])
+    app.router.add_get("/api/health", _api_health)
+    app.router.add_get("/api/teams", _api_teams)
+    app.router.add_get("/api/teams/{team_id}/players", _api_team_players)
+    app.router.add_get("/api/transfers", _api_transfers)
+    app.router.add_get("/api/offers", _api_offers)
+    _api_runner = web.AppRunner(app)
+    await _api_runner.setup()
+    port = int(os.getenv("PORT", "8080"))
+    site = web.TCPSite(_api_runner, host="0.0.0.0", port=port)
+    await site.start()
+    print(f"[api] Dashboard API listening on 0.0.0.0:{port}")
+    if not DASHBOARD_API_KEY:
+        print("[api] WARNING: Set DASHBOARD_API_KEY in Railway Variables before connecting Base44.")
+
 _cleaned = False
 _startup_checked = False
 
@@ -3536,6 +3688,7 @@ _startup_checked = False
 async def on_ready():
     global _cleaned, _startup_checked
     print(f"Logged in as {bot.user}")
+    await start_dashboard_api()
     if not _startup_checked:
         _startup_checked = True
         asyncio.create_task(startup_data_check())
