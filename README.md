@@ -173,3 +173,23 @@ The `#pitchx-backups` Discord channel is a second safety net, so even a deleted 
 - Transfer announcements now retry in four steps (with image, without image, simplified embed, plain text) so something is ALWAYS posted,
   and the admin DM contains Discord's exact error (e.g. `HTTP 400, code 50035`) if the full version was refused.
 - Links in buttons and logos are trimmed and validated, so a stray space in a variable can't make Discord reject posts.
+
+## View Profile button: opens the GAME profile
+The "View Profile" button under transfer posts, matchday messages and so on now opens the player's **in-Discord game profile card** (team, value, goals,
+assists, clean sheets, rank, trophies). Only the person who clicks sees it. It no longer opens the Discord profile.
+Optional: set `PROFILE_URL` (e.g. `https://yoursite.com/player/{user_id}`) only if you have a website profile page; the button then links there instead.
+An old `PROFILE_URL=https://discord.com/users/...` value is ignored automatically.
+
+## Posting the league table for everyone (admins)
+`/table` is private by default. Staff (admins, Manage Server, the staff role) can add options:
+- `post: True`: post the table publicly in the current channel.
+- `channel: #standings`: post it in a specific channel instead.
+- `ping: True` (default when posting): pings **every team's role** in the posted division(s), found by name, e.g. `@NAPXR | RMA`, `@NAPXR | kakadrip MCI`.
+  It only ever pings roles: **never @everyone**, never manager/owner roles. The admin gets a note if a team has no role, or if a role can't be pinged
+  (make the role mentionable, or give the bot the "Mention @everyone, @here and All Roles" permission; the bot still never uses @everyone).
+- `ping: False`: post without pinging anyone.
+When posted publicly the table does not highlight anyone's team.
+
+## Web dashboard API (your Base44 dashboard)
+Read-only endpoints, protected by the `X-API-Key` header (`DASHBOARD_API_KEY` in Railway Variables). `GET /api/health` needs no key.
+Two small safety fixes were added: a non-ASCII key header now returns 401 instead of an error, and if the API can't start (port busy) the rest of the bot still starts.

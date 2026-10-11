@@ -35,7 +35,9 @@ def _url(v):
     return v if v.startswith(("http://", "https://")) and " " not in v else None
 
 LEAGUE_LOGO = _url(os.getenv("LEAGUE_LOGO_URL"))
-PROFILE_URL = _url(os.getenv("PROFILE_URL")) or "https://discord.com/users/{user_id}"
+PROFILE_URL = _url(os.getenv("PROFILE_URL"))   # optional: a website profile page; otherwise the button opens the in-Discord game profile
+if PROFILE_URL and "discord.com/users" in PROFILE_URL:
+    PROFILE_URL = None   # the old default pointed at the Discord profile: use the in-Discord GAME profile instead
 DASHBOARD_URL = _url(os.getenv("DASHBOARD_URL")) or "https://vclgg-napxrgg-manager-dash-68.base44.app/"
 REMINDER_DAYS = float(os.getenv("REMINDER_DAYS", "14"))
 # Warnings about the bot itself (data loss, broken permissions...) are DMed ONLY to these Discord user IDs. Override with the ADMIN_USER_IDS variable.
@@ -217,9 +219,12 @@ async def tier_ac(_, current: str):
     return [app_commands.Choice(name=r["name"], value=r["name"]) for r in rows]
 
 def profile_view(user_id):
-    v = discord.ui.View()
-    v.add_item(discord.ui.Button(label="View Your Profile", emoji="↗️",
-                                 url=PROFILE_URL.replace("{user_id}", str(user_id))))
+    """The 'View Profile' button under posts: opens the player's GAME profile card (or your website page if PROFILE_URL is set)."""
+    v = discord.ui.View(timeout=None)
+    if PROFILE_URL:
+        v.add_item(discord.ui.Button(label="View Profile", emoji="↗️", url=PROFILE_URL.replace("{user_id}", str(user_id))))
+    else:
+        v.add_item(ProfileButton(user_id))
     return v
 
 def dashboard_view():
@@ -702,18 +707,55 @@ async def trophy_ac(_, current: str):
     rows = db.execute("SELECT name FROM trophy_types WHERE name LIKE ? ORDER BY name LIMIT 25", (f"%{current}%",)).fetchall()
     return [app_commands.Choice(name=r["name"], value=r["name"]) for r in rows]
 
-@bot.tree.command(description="View a player card: team, value, goals, assists, clean sheets, trophies")
-async def profile(i: discord.Interaction, player: discord.Member = None, private: bool = False):
-    await i.response.defer(ephemeral=private)
-    member = player or i.user
-    cabinet = trophy_cabinet(member.id)
+class ProfileButton(discord.ui.DynamicItem[discord.ui.Button], template=r"pitchx:profile:(?P<id>[0-9]+)"):
+    """'View Profile' button: shows the player's GAME profile card (stats, value, team, trophies) privately to whoever clicks it."""
+    def __init__(self, user_id: int):
+        super().__init__(discord.ui.Button(label="View Profile", emoji="⚽", style=discord.ButtonStyle.secondary,
+                                           custom_id=f"pitchx:profile:{user_id}"))
+        self.user_id = int(user_id)
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(int(match["id"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        await send_profile(interaction, self.user_id, True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        traceback.print_exception(type(error), error, error.__traceback__)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("⚠️ I couldn't open that profile.", ephemeral=True)
+            else:
+                await interaction.response.send_message("⚠️ I couldn't open that profile.", ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+async def send_profile(i, uid, private=True, member=None):
+    """Send a player card as a followup (the interaction must already be deferred)."""
+    if member is None:
+        guild = i.guild or get_guild()
+        member = guild.get_member(uid) if guild else None
+        if member is None:
+            try:
+                member = await bot.fetch_user(uid)
+            except discord.HTTPException:
+                return await i.followup.send("I couldn't find that player.", ephemeral=True)
+    cabinet = trophy_cabinet(uid)
     e = profile_embed(member, cabinet)
     kw = {}
     if cabinet and Image is not None:
         png = await run_render(render_cabinet, cabinet)
         kw["file"] = discord.File(io.BytesIO(png), filename="cabinet.png")
         e.set_image(url="attachment://cabinet.png")     # shows right under the trophy cabinet
-    await i.followup.send(embed=e, **kw)
+    await i.followup.send(embed=e, ephemeral=private, **kw)
+
+@bot.tree.command(description="View a player card: team, value, goals, assists, clean sheets, trophies")
+async def profile(i: discord.Interaction, player: discord.Member = None, private: bool = False):
+    await i.response.defer(ephemeral=private)
+    member = player or i.user
+    await send_profile(i, member.id, private, member)
 
 @bot.tree.command(description="Create a trophy with a name and logo (admins only)")
 @admin_only
@@ -2197,22 +2239,61 @@ def _table_key(title, rows, logos, highlight_id, div_logo):
                        for r in rows[:30]),
                  tuple(hash(x) if x else 0 for x in logos)))
 
-@bot.tree.command(name="table", description="League table with every team's logo and position (only you see it)")
+def team_role_pings(guild, tiers):
+    """Mentions for every team role in these divisions. Never @everyone. Returns (text, teams with no role, roles I can't ping)."""
+    seen, mentions, missing, cant = set(), [], [], []
+    for tr in tiers:
+        for t in db.execute("SELECT name FROM teams WHERE tier=? ORDER BY name", (tr,)).fetchall():
+            r = find_team_role(guild, t["name"])
+            if not r:
+                missing.append(t["name"])
+                continue
+            if r.id in seen:
+                continue
+            seen.add(r.id)
+            mentions.append(r.mention)
+            if not (r.mentionable or guild.me.guild_permissions.mention_everyone):
+                cant.append(r.name)
+    return " ".join(mentions), missing, cant
+
+async def post_table(guild, target, pngs, tiers, ping=True):
+    """Post the table images for everyone, pinging each team's role (roles only: never @everyone). Returns notes for the admin."""
+    content, missing, cant = team_role_pings(guild, tiers) if (ping and guild) else ("", [], [])
+    kw = {"files": [discord.File(io.BytesIO(b), filename=f"table_{k + 1}.png") for k, b in enumerate(pngs)],
+          "allowed_mentions": discord.AllowedMentions(everyone=False, users=False, roles=True)}
+    if content:
+        kw["content"] = content[:1900]
+    await target.send(**kw)
+    notes = []
+    if missing:
+        notes.append(f"⚠️ No role found for: {', '.join(missing[:10])}")
+    if cant:
+        notes.append(f"⚠️ These roles got no ping: {', '.join(cant[:10])}. Make them mentionable, or give me the 'Mention @everyone, @here and All Roles' permission (I still never use @everyone).")
+    return notes
+
+@bot.tree.command(name="table", description="League table with every team's logo. Admins can post it for everyone")
+@app_commands.describe(tier="Which division (default: all of them)", post="Admins: post it publicly for everyone",
+                       channel="Admins: post it in this channel instead of here",
+                       ping="When posting: ping every team's role (never @everyone)")
 @app_commands.autocomplete(tier=tier_ac)
-async def table_cmd(i: discord.Interaction, tier: str = None):
+async def table_cmd(i: discord.Interaction, tier: str = None, post: bool = False,
+                    channel: discord.TextChannel = None, ping: bool = True):
+    publish = post or channel is not None
+    if publish and not (isinstance(i.user, discord.Member) and is_staff_member(i.user)):
+        return await i.response.send_message("Only staff can post the table for everyone. Run /table without those options to see it privately.", ephemeral=True)
     await i.response.defer(ephemeral=True)
     if Image is None:
         return await i.followup.send("❌ Pillow isn't installed on the host, so I can't draw the table. Add `Pillow` to requirements.txt.")
     tiers = [tier] if tier else [r["name"] for r in db.execute("SELECT name FROM divisions ORDER BY name").fetchall()]
     mine = player_team(i.user.id)
-    files = []
-    for n, tr in enumerate(tiers[:10]):
+    pngs, used = [], []
+    for tr in tiers[:10]:
         rows = standings(tr)
         if not rows:
             continue
         logos = await asyncio.gather(*(team_logo_bytes(r["team"]) for r in rows[:30]))   # stored copies: no downloads
         div = db.execute("SELECT logo FROM divisions WHERE name=?", (tr,)).fetchone()
-        title, hl, dlogo = f"{league_short()} Table - {tr}", (mine["id"] if mine else None), (div["logo"] if div else None)
+        title, hl, dlogo = f"{league_short()} Table - {tr}", (None if publish else (mine["id"] if mine else None)), (div["logo"] if div else None)
         key = _table_key(title, rows, logos, hl, dlogo)
         png = _table_cache.get(key)
         if png is None:                                  # only redraw when results/logos actually changed
@@ -2220,10 +2301,18 @@ async def table_cmd(i: discord.Interaction, tier: str = None):
             if len(_table_cache) > 40:
                 _table_cache.pop(next(iter(_table_cache)))
             _table_cache[key] = png
-        files.append(discord.File(io.BytesIO(png), filename=f"table_{n + 1}.png"))
-    if not files:
+        pngs.append(png)
+        used.append(tr)
+    if not pngs:
         return await i.followup.send("No teams yet.")
-    await i.followup.send(files=files)
+    if not publish:
+        return await i.followup.send(files=[discord.File(io.BytesIO(b), filename=f"table_{k + 1}.png") for k, b in enumerate(pngs)])
+    target = channel or i.channel
+    try:
+        notes = await post_table(i.guild, target, pngs, used, ping)
+    except Exception as ex:
+        return await i.followup.send(f"❌ I couldn't post in {target.mention}: {err_text(ex)}. I need View Channel, Send Messages and Attach Files there.")
+    await i.followup.send(f"✅ Posted the table in {target.mention}." + ("\n" + "\n".join(notes) if notes else ""))
 
 @bot.tree.command(description="Move ALL scheduled fixtures of a tier so the first one starts at a new date/time")
 @staff
@@ -3521,7 +3610,7 @@ async def on_app_error(i: discord.Interaction, error: app_commands.AppCommandErr
 
 @bot.event
 async def setup_hook():
-    bot.add_dynamic_items(OfferButton)
+    bot.add_dynamic_items(OfferButton, ProfileButton)
     reminder_loop.start()
     backup_loop.start()
     matchday_loop.start()
@@ -3551,7 +3640,7 @@ _api_runner = None
 def _api_authorized(request):
     supplied = request.headers.get("X-API-Key", "")
     return bool(DASHBOARD_API_KEY and supplied and
-                hmac.compare_digest(supplied, DASHBOARD_API_KEY))
+                hmac.compare_digest(supplied.encode("utf-8", "replace"), DASHBOARD_API_KEY.encode("utf-8", "replace")))
 
 @web.middleware
 async def _dashboard_api_auth(request, handler):
@@ -3697,7 +3786,10 @@ _startup_checked = False
 async def on_ready():
     global _cleaned, _startup_checked
     print(f"Logged in as {bot.user}")
-    await start_dashboard_api()
+    try:
+        await start_dashboard_api()
+    except Exception as ex:
+        print(f"[api] the dashboard API could not start: {ex!r}")
     if not _startup_checked:
         _startup_checked = True
         asyncio.create_task(startup_data_check())
