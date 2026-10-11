@@ -1041,11 +1041,18 @@ def apply_offer(o):
 
 _last_image_error = ""
 
+def missing_channel_perms(channel, me, need=(("View Channel", "view_channel"), ("Send Messages", "send_messages"), ("Attach Files", "attach_files"))):
+    """Which permissions the bot lacks in a channel (the bot's own, not the person who ran the command)."""
+    p = channel.permissions_for(me)
+    return [name for name, attr in need if not getattr(p, attr)]
+
 def err_text(ex):
     """Exact reason Discord gave (status, code, message) so a failure can actually be diagnosed."""
     status, code = getattr(ex, "status", None), getattr(ex, "code", None)
     if status is not None:
-        return f"HTTP {status}, code {code}: {str(getattr(ex, 'text', '') or ex)[:260]}"
+        hint = {50001: " (the bot can't SEE that channel: add the bot's role under the channel's Permissions)",
+                50013: " (a permission is missing: Send Messages, Embed Links or Attach Files)"}.get(code, "")
+        return f"HTTP {status}, code {code}: {str(getattr(ex, 'text', '') or ex)[:260]}{hint}"
     return f"{type(ex).__name__}: {str(ex)[:200]}"
 
 def perm_error(ex):
@@ -2284,6 +2291,14 @@ async def table_cmd(i: discord.Interaction, tier: str = None, post: bool = False
     await i.response.defer(ephemeral=True)
     if Image is None:
         return await i.followup.send("❌ Pillow isn't installed on the host, so I can't draw the table. Add `Pillow` to requirements.txt.")
+    if publish and i.guild:
+        target = channel or i.channel
+        lacking = missing_channel_perms(target, i.guild.me)
+        if lacking:
+            return await i.followup.send(
+                f"❌ I can't post in {target.mention}: **I** am missing **{', '.join(lacking)}** there. Your own roles don't matter, because I post as the bot. "
+                f"Open the channel, go to Settings → Permissions, add the bot's role and allow those. "
+                f"For a table everyone can see, use a public channel, e.g. `channel:#standings`.")
     tiers = [tier] if tier else [r["name"] for r in db.execute("SELECT name FROM divisions ORDER BY name").fetchall()]
     mine = player_team(i.user.id)
     pngs, used = [], []
